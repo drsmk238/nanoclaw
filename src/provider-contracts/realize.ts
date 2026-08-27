@@ -5,7 +5,7 @@ import { DATA_DIR } from '../config.js';
 import { materializeTemplateSkills } from '../group-skills.js';
 import { log } from '../log.js';
 import { writeAtomic } from '../migrate-claude-memory-settings.js';
-import { DEFAULT_PROJECT_DOC, type ProjectDocSpec } from '../project-doc-compose.js';
+import { BASE_INSTRUCTIONS_PATH, type ProjectDocSpec } from '../project-doc-compose.js';
 
 import {
   describeRegisteredProviderFileTransformers,
@@ -20,20 +20,28 @@ import {
   type ProviderStateVolume,
 } from './registry.js';
 
-// Core-owned: the shipped base document is protected unconditionally; no
-// provider contract switches this on or off.
+/**
+ * The host file a contract's project document is rendered from. Every
+ * contract renders from core's canonical instruction template; a contract
+ * declares facts for it, never a document of its own.
+ */
+export function providerDocumentSourcePath(projectRoot: string, contract: ProviderHostContract): string | undefined {
+  if (contract.projectDocument === undefined) return undefined;
+  return path.resolve(projectRoot, BASE_INSTRUCTIONS_PATH);
+}
+
+// Core-owned: the canonical instruction template is protected unconditionally;
+// no provider contract switches this on or off.
 export function protectedProviderDocumentSourcePaths(projectRoot: string): string[] {
-  return [path.resolve(projectRoot, DEFAULT_PROJECT_DOC.baseDocPath)];
+  return [path.resolve(projectRoot, BASE_INSTRUCTIONS_PATH)];
 }
 
 export function providerProjectDocSpec(contract: ProviderHostContract): ProjectDocSpec | undefined {
   if (contract.projectDocument === undefined) return undefined;
-  const { fileName, baseDocumentFile, extraSections, maxBytes } = contract.projectDocument;
-  resolveWithinRoot(path.resolve(process.cwd(), 'container'), baseDocumentFile);
+  const { fileName, instructions, maxBytes } = contract.projectDocument;
   return {
     fileName,
-    baseDocPath: path.join('container', baseDocumentFile),
-    ...(extraSections ? { extraSections } : {}),
+    ...(instructions ? { instructions } : {}),
     ...(maxBytes === undefined ? {} : { maxBytes }),
   };
 }

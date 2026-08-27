@@ -67,7 +67,6 @@ registerProviderHostContract('ordered-mount-provider', {
   seamVersion: PROVIDER_HOST_CONTRACT_SEAM_VERSION,
   projectDocument: {
     fileName: 'AGENTS.md',
-    baseDocumentFile: 'CLAUDE.md',
     containerPath: '/workspace/agent/AGENTS.md',
     mountClass: 'allowlisted-extra',
   },
@@ -112,7 +111,6 @@ registerProviderHostContract('partial-install-provider', {
   seamVersion: PROVIDER_HOST_CONTRACT_SEAM_VERSION,
   projectDocument: {
     fileName: 'AGENTS.md',
-    baseDocumentFile: 'AGENTS.md',
     containerPath: '/workspace/agent/AGENTS.md',
     mountClass: 'group-state',
   },
@@ -484,7 +482,6 @@ describe('derived provider spawn surfaces', () => {
       seamVersion: PROVIDER_HOST_CONTRACT_SEAM_VERSION,
       projectDocument: {
         fileName: 'AGENTS.md',
-        baseDocumentFile: 'AGENTS.md',
         containerPath: '/workspace/agent/AGENTS.md',
         mountClass: 'group-state',
       },
@@ -501,7 +498,6 @@ describe('derived provider spawn surfaces', () => {
       seamVersion: PROVIDER_HOST_CONTRACT_SEAM_VERSION,
       projectDocument: {
         fileName: 'AGENTS.md',
-        baseDocumentFile: 'AGENTS.md',
         containerPath: '/workspace/agent/AGENTS.md',
         mountClass: 'group-state',
       },
