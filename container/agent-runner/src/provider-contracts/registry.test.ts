@@ -93,10 +93,10 @@ describe('provider runtime contracts', () => {
     expect(policy.disallowedTools).toContain('AskUserQuestion');
 
     const inference = asFunction(contract.configuration.inference)(
-      { model: 'opus', effort: 'high', fastMode: true },
+      { model: 'opus', effort: 'high', speed: 'fast' },
       {},
     );
-    expect(inference).toEqual({ model: 'opus', effort: 'high', fastMode: true });
+    expect(inference).toEqual({ model: 'opus', effort: 'high', settings: { fastMode: true } });
 
     const mcp = asFunction(contract.configuration.mcpServers)({ nanoclaw: { command: 'bun' } }, {}) as {
       allowedTools: string[];

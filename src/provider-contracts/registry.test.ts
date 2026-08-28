@@ -144,6 +144,42 @@ describe('provider host contracts', () => {
     expect(() => (stored.commands!.nativeAdmin as string[]).push('/later')).toThrow();
   });
 
+  describe('inference.speedTiers', () => {
+    it('is declared by Claude as standard and fast', () => {
+      expect(getProviderHostContract('claude')?.inference?.speedTiers).toEqual(['standard', 'fast']);
+    });
+
+    it('is optional — a provider that declares nothing has no tiers', () => {
+      const name = contractName('inference', 'absent');
+      registerProviderHostContract(name, emptyContract());
+      expect(getProviderHostContract(name)?.inference).toBeUndefined();
+    });
+
+    it('accepts provider-specific tier names and freezes them', () => {
+      const name = contractName('inference', 'custom');
+      registerProviderHostContract(name, { ...emptyContract(), inference: { speedTiers: ['eco', 'turbo-plus'] } });
+      const tiers = getProviderHostContract(name)!.inference!.speedTiers;
+      expect(tiers).toEqual(['eco', 'turbo-plus']);
+      expect(Object.isFrozen(tiers)).toBe(true);
+    });
+
+    it.each([
+      ['an empty list', [], /inference\.speedTiers must not be empty/],
+      ['a non-array', 'fast', /inference\.speedTiers must be an array/],
+      ['an uppercase tier', ['standard', 'Fast'], /inference\.speedTiers\[\] must be lowercase kebab-case/],
+      ['a spaced tier', ['very fast'], /inference\.speedTiers\[\] must be lowercase kebab-case/],
+      ['an empty tier', [''], /inference\.speedTiers\[\] must be lowercase kebab-case/],
+      ['a non-string tier', [1], /inference\.speedTiers\[\] must be lowercase kebab-case/],
+      ['a duplicate tier', ['fast', 'fast'], /inference\.speedTiers must be unique; duplicate 'fast'/],
+    ])('rejects %s at registration and stores nothing', (_label, speedTiers, expected) => {
+      const name = contractName(`inference-${_label}`, 'invalid');
+      expect(() => registerProviderHostContract(name, claudeContractWith('inference.speedTiers', speedTiers))).toThrow(
+        expected,
+      );
+      expect(hasDeclaredProviderContract(name)).toBe(false);
+    });
+  });
+
   it('requires a project document', () => {
     expect(() =>
       registerProviderHostContract(
@@ -292,6 +328,8 @@ describe('provider host contracts', () => {
     ['files.0.prepare.when', 'claude.files.claude-settings.prepare.when'],
     ['commands.nativeAdmin', 'claude.commands.nativeAdmin'],
     ['commands.nativeFiltered', 'claude.commands.nativeFiltered'],
+    ['inference', 'claude.inference'],
+    ['inference.speedTiers', 'claude.inference.speedTiers'],
   ])('rejects invalid %s at registration', (path, field) => {
     expect(() =>
       registerProviderHostContract(contractName(path, 'invalid'), claudeContractWith(path, 'invalid')),

@@ -14,7 +14,7 @@ export function createProvider(name: string, options: ProviderOptions = {}): Age
   // The core-owned inputs for this instance: one object, owned here, closed
   // over by the render path below.
   const inputs: Partial<RuntimeConfigurationInputs> = {
-    inference: { model: options.model, effort: options.effort, fastMode: options.fastMode },
+    inference: { model: options.model, effort: options.effort, speed: options.speed },
     mcpServers: options.mcpServers ?? {},
   };
   // Core resolves the declared configuration and hands the result to the

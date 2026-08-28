@@ -62,4 +62,7 @@ registerProviderHostContract('claude', {
     nativeAdmin: ['/compact', '/context', '/cost', '/files'],
     nativeFiltered: ['/start', '/help', '/login', '/logout', '/doctor', '/config', '/remote-control'],
   },
+  // `fast` maps onto the SDK's fast serving tier; `standard` lets a group
+  // explicitly override an install-wide NANOCLAW_FAST_MODE=true.
+  inference: { speedTiers: ['standard', 'fast'] },
 });

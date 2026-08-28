@@ -1,5 +1,13 @@
 import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 
+/**
+ * A speed tier name. The vocabulary is provider-declared (the host validates
+ * `--speed` against the provider's `inference.speedTiers`), so this is an
+ * opaque token here; a provider reacts to the names it declared and ignores
+ * the rest.
+ */
+export type ProviderSpeed = string;
+
 export interface AgentProvider {
   /**
    * Register shared memory through the provider's native session-start
@@ -79,10 +87,11 @@ export interface ProviderOptions {
    */
   effort?: string;
   /**
-   * API fast serving tier: faster output at a higher per-token price. Passed
-   * through to the underlying SDK. If omitted, the SDK default is used.
+   * Provider-declared speed tier (`standard` or `fast` for Claude). A provider
+   * maps `fast` onto its own fast serving tier when it has one; `standard`
+   * keeps the provider default; a tier it did not declare never reaches it.
    */
-  fastMode?: boolean;
+  speed?: ProviderSpeed;
 }
 
 export interface QueryInput {

@@ -57,6 +57,7 @@ import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // remains tied to src/providers/index.ts.
 import './provider-contracts/index.js';
 import { getProviderHostContract } from './provider-contracts/registry.js';
+import { resolveProviderName } from './providers/provider-name.js';
 import {
   providerStateVolumePath,
   realizeProviderSpawnSurfaces,
@@ -754,13 +755,12 @@ export async function honorPendingStopIntents(
  * Resolve the provider name for a session:
  *
  *   sessions.agent_provider → container_configs.provider → 'claude'
+ *
+ * The rule lives in providers/provider-name.ts so host commands that validate
+ * against the group's provider (e.g. `--speed`) share it; re-exported here for
+ * the spawn path's existing callers.
  */
-export function resolveProviderName(
-  sessionProvider: string | null | undefined,
-  containerConfigProvider: string | null | undefined,
-): string {
-  return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
-}
+export { resolveProviderName };
 
 export async function resolveProviderContribution(
   session: Session,

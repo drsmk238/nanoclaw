@@ -99,12 +99,20 @@ export function resolveClaudeExecutionPolicy(): {
   };
 }
 
-/** Model, reasoning effort, and fast mode pass through; the SDK owns defaults. */
+/**
+ * Model and reasoning effort pass to the SDK verbatim; the SDK owns defaults.
+ * `speed: 'fast'` maps to the SDK's `fastMode` settings key (the `/fast`
+ * toggle); `standard` keeps the SDK default. Unknown values are ignored.
+ */
 export function resolveClaudeInference(
   input: RuntimeInferenceInput,
   _environment: NodeJS.ProcessEnv,
-): { model?: string; effort?: string; fastMode?: boolean } {
-  return { model: input.model, effort: input.effort, fastMode: input.fastMode };
+): { model?: string; effort?: string; settings?: { fastMode: boolean } } {
+  return {
+    model: input.model,
+    effort: input.effort,
+    ...(input.speed === 'fast' ? { settings: { fastMode: true } } : {}),
+  };
 }
 
 /**

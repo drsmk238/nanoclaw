@@ -57,7 +57,7 @@ async function drive(options: ProviderOptions): Promise<void> {
 
 describe('fast mode reaches the SDK through settings', () => {
   it('sends settings.fastMode when enabled', async () => {
-    await drive({ fastMode: true });
+    await drive({ speed: 'fast' });
     expect(lastOptions?.settings).toEqual({ fastMode: true });
   });
 
@@ -66,13 +66,13 @@ describe('fast mode reaches the SDK through settings', () => {
     expect(lastOptions && 'settings' in lastOptions).toBe(false);
   });
 
-  it('sends no settings key when explicitly false', async () => {
-    await drive({ fastMode: false });
+  it('sends no settings key for standard speed', async () => {
+    await drive({ speed: 'standard' });
     expect(lastOptions && 'settings' in lastOptions).toBe(false);
   });
 
   it('leaves the settingSources chain untouched either way', async () => {
-    await drive({ fastMode: true });
+    await drive({ speed: 'fast' });
     expect(lastOptions?.settingSources).toEqual(['project', 'user', 'local']);
     await drive({});
     expect(lastOptions?.settingSources).toEqual(['project', 'user', 'local']);

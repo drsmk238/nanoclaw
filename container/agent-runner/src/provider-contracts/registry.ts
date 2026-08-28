@@ -9,7 +9,7 @@
  * probes live in verifier code, not in the startup registry path.
  */
 
-import type { McpServerConfig, ProviderExchange } from '../providers/types.js';
+import type { McpServerConfig, ProviderExchange, ProviderSpeed } from '../providers/types.js';
 
 export const PROVIDER_RUNTIME_CONTRACT_SEAM_VERSION = 1;
 
@@ -28,7 +28,7 @@ export interface RuntimeMemoryHookInput {
 export interface RuntimeInferenceInput {
   model?: string;
   effort?: string;
-  fastMode?: boolean;
+  speed?: ProviderSpeed;
 }
 
 /**

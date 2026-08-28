@@ -105,6 +105,17 @@ export interface ProviderPreparedFile {
   };
 }
 
+/**
+ * Inference vocabulary the provider accepts. Core validates
+ * `ncl groups config update --speed` against `speedTiers`, stores the tier,
+ * and passes it through unchanged; the provider owns the names and their
+ * meaning. A provider that declares nothing accepts no speed tier (only `""`
+ * to clear).
+ */
+export interface ProviderInferenceDeclaration {
+  speedTiers: readonly string[];
+}
+
 export interface ProviderHostContract {
   seamVersion: number;
   /** Core-composed project document carrying the provider's standing instructions. */
@@ -119,6 +130,8 @@ export interface ProviderHostContract {
     nativeAdmin?: readonly string[];
     nativeFiltered?: readonly string[];
   };
+  /** Provider-declared inference vocabulary; absent means no speed tier is accepted. */
+  inference?: ProviderInferenceDeclaration;
 }
 
 const registry = new Map<string, ProviderHostContract>();
@@ -188,6 +201,17 @@ export function assertProviderHostContractShape(provider: string, contract: Prov
   assertCommandArray(contract.commands?.nativeFiltered, `${provider}.commands.nativeFiltered`);
   unique(contract.commands?.nativeAdmin ?? [], `${provider}.commands.nativeAdmin`);
   unique(contract.commands?.nativeFiltered ?? [], `${provider}.commands.nativeFiltered`);
+  if (contract.inference !== undefined) {
+    if (contract.inference === null || typeof contract.inference !== 'object') {
+      throw new Error(`${provider}.inference must be an object`);
+    }
+    assertArray(contract.inference.speedTiers, `${provider}.inference.speedTiers`);
+    if (contract.inference.speedTiers.length === 0) {
+      throw new Error(`${provider}.inference.speedTiers must not be empty`);
+    }
+    for (const tier of contract.inference.speedTiers) assertName(tier, `${provider}.inference.speedTiers[]`);
+    unique(contract.inference.speedTiers, `${provider}.inference.speedTiers`);
+  }
 
   const volumeIds = unique(
     contract.stateVolumes.map((volume) => volume.id),
