@@ -60,7 +60,7 @@ import { addMember } from '../src/modules/permissions/db/agent-group-members.js'
 import { getUserRoles, grantRole } from '../src/modules/permissions/db/user-roles.js';
 import { upsertUser } from '../src/modules/permissions/db/users.js';
 import { ensureContainerConfig, updateContainerConfigScalars } from '../src/db/container-configs.js';
-import { namespacedPlatformId } from '../src/platform-id.js';
+import { assertWhatsAppHandle, namespacedPlatformId } from '../src/platform-id.js';
 import type { AgentGroup, MessagingGroup } from '../src/types.js';
 
 type Role = 'owner' | 'admin' | 'member';
@@ -172,6 +172,23 @@ function parseArgs(argv: string[]): Args {
     );
     console.error('See scripts/init-first-agent.ts header for usage.');
     process.exit(2);
+  }
+
+  // Seed-time identity check. A handle that does not match what the adapter
+  // will later emit wires an agent that sends but never receives, so fail
+  // here rather than let the mismatch surface as an unknown-sender card.
+  if (out.channel === 'whatsapp') {
+    for (const [flag, value] of [
+      ['--user-id', out.userId!],
+      ['--platform-id', out.platformId!],
+    ] as const) {
+      try {
+        assertWhatsAppHandle(value);
+      } catch (err) {
+        console.error(`${flag}: ${(err as Error).message}`);
+        process.exit(2);
+      }
+    }
   }
 
   return {
