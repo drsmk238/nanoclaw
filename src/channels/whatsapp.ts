@@ -104,6 +104,23 @@ const AUTH_DIR = path.join(process.cwd(), 'store', 'auth');
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24h
 const GROUP_METADATA_CACHE_TTL_MS = 60_000; // 1 min for outbound sends
 const SENT_MESSAGE_CACHE_MAX = 256;
+const RECENT_INBOUND_MAX = 200;
+
+/** The inbound message a reply quotes — Baileys wants the whole record. */
+type WAQuoted = WAMessage;
+
+/**
+ * The chat message an outbound reply is answering, or null if it answers none.
+ * The router hands the agent an inbound id as `<wa-message-id>:<group>`; work
+ * handed over by another agent (`a2a-…`), started by a task, or echoed back
+ * carries an id of its own shape and replies to nothing in this chat.
+ */
+export function quotableMessageId(inReplyTo: string | null | undefined): string | null {
+  if (!inReplyTo) return null;
+  const id = inReplyTo.replace(/:ag-[^:]*$/, '');
+  if (!id || /^(a2a|task|msg)-/.test(id)) return null;
+  return id.includes(':') ? null : id;
+}
 const RECONNECT_DELAY_MS = 5000;
 const PENDING_QUESTIONS_MAX = 64;
 
@@ -428,11 +445,15 @@ registerChannelAdapter('whatsapp', {
     let botPhoneJid: string | undefined;
 
     // Outgoing queue for messages sent while disconnected
-    const outgoingQueue: Array<{ jid: string; text: string; mentions?: string[] }> = [];
+    const outgoingQueue: Array<{ jid: string; text: string; mentions?: string[]; quoted?: WAQuoted }> = [];
     let flushing = false;
 
     // Sent message cache for retry/re-encrypt requests
     const sentMessageCache = new Map<string, any>();
+    // Recent inbound messages, so a reply can quote the one it answers, and the
+    // newest message per chat, so it only bothers when something intervened.
+    const recentInbound = new Map<string, WAQuoted>();
+    const latestInboundByChat = new Map<string, string>();
 
     // Group metadata cache with TTL
     const groupMetadataCache = new Map<string, { metadata: GroupMetadata; expiresAt: number }>();
@@ -556,7 +577,7 @@ registerChannelAdapter('whatsapp', {
           const item = outgoingQueue.shift()!;
           const payload: { text: string; mentions?: string[] } = { text: item.text };
           if (item.mentions && item.mentions.length > 0) payload.mentions = item.mentions;
-          const sent = await sock.sendMessage(item.jid, payload);
+          const sent = await sock.sendMessage(item.jid, payload, item.quoted ? { quoted: item.quoted } : undefined);
           if (sent?.key?.id && sent.message) {
             sentMessageCache.set(sent.key.id, sent.message);
           }
@@ -634,16 +655,37 @@ registerChannelAdapter('whatsapp', {
       return { attachments: results, failures };
     }
 
-    async function sendRawMessage(jid: string, text: string, mentions?: string[]): Promise<string | undefined> {
+    /**
+     * WhatsApp has no subjects and no threads: a reply is just another message
+     * in the chat. That is fine in a quiet conversation and confusing in a busy
+     * one — when two scheduled runs answer while you are mid-conversation, the
+     * replies arrive with nothing to say which question each belongs to. So a
+     * reply quotes the message it answers, but only when something else has
+     * arrived since; quoting the message directly above adds clutter and says
+     * nothing.
+     */
+    function quoteFor(chatJid: string, inReplyTo: string | null | undefined): WAQuoted | undefined {
+      const id = quotableMessageId(inReplyTo);
+      if (!id) return undefined;
+      if (latestInboundByChat.get(chatJid) === id) return undefined;
+      return recentInbound.get(id);
+    }
+
+    async function sendRawMessage(
+      jid: string,
+      text: string,
+      mentions?: string[],
+      quoted?: WAQuoted,
+    ): Promise<string | undefined> {
       if (!connected) {
-        outgoingQueue.push({ jid, text, mentions });
+        outgoingQueue.push({ jid, text, mentions, quoted });
         log.info('WA disconnected, message queued', { jid, queueSize: outgoingQueue.length });
         return;
       }
       try {
         const payload: { text: string; mentions?: string[] } = { text };
         if (mentions && mentions.length > 0) payload.mentions = mentions;
-        const sent = await sock.sendMessage(jid, payload);
+        const sent = await sock.sendMessage(jid, payload, quoted ? { quoted } : undefined);
         if (sent?.key?.id && sent.message) {
           sentMessageCache.set(sent.key.id, sent.message);
           if (sentMessageCache.size > SENT_MESSAGE_CACHE_MAX) {
@@ -979,6 +1021,16 @@ registerChannelAdapter('whatsapp', {
               });
             }
 
+            // Keep the message itself, so a reply can quote it if other
+            // messages land in between.
+            if (msg.key?.id && msg.message) {
+              recentInbound.set(msg.key.id, msg as WAMessage);
+              if (recentInbound.size > RECENT_INBOUND_MAX) {
+                recentInbound.delete(recentInbound.keys().next().value!);
+              }
+              latestInboundByChat.set(chatJid, msg.key.id);
+            }
+
             // WhatsApp doesn't use threads — threadId is null
             setupConfig.onInbound(chatJid, null, inbound);
           } catch (err) {
@@ -1018,6 +1070,8 @@ registerChannelAdapter('whatsapp', {
         message: OutboundMessage,
       ): Promise<string | undefined> {
         const content = message.content as Record<string, unknown>;
+        // Which of Steven's messages, if any, this one is answering.
+        const quoted = quoteFor(platformId, (message as { inReplyTo?: string | null }).inReplyTo);
 
         // Ask question → text with slash command replies
         if (content.type === 'ask_question' && content.questionId && content.options) {
@@ -1032,7 +1086,7 @@ registerChannelAdapter('whatsapp', {
 
           const optionLines = options.map((o) => `  ${optionToCommand(o.label)}`).join('\n');
           const text = `*${title}*\n\n${question}\n\nReply with:\n${optionLines}`;
-          const msgId = await sendRawMessage(platformId, text);
+          const msgId = await sendRawMessage(platformId, text, undefined, quoted);
           if (msgId) {
             pendingQuestions.set(platformId, { questionId, options });
             if (pendingQuestions.size > PENDING_QUESTIONS_MAX) {
@@ -1086,7 +1140,8 @@ registerChannelAdapter('whatsapp', {
               }
               const mediaMsg = buildMediaMessage(file.data, file.filename, ext, caption);
               if (captionMentions) mediaMsg.mentions = captionMentions;
-              const sent = await sock.sendMessage(platformId, mediaMsg);
+              // Only the captioned attachment quotes; the rest are the same reply.
+              const sent = await sock.sendMessage(platformId, mediaMsg, caption && quoted ? { quoted } : undefined);
               if (sent?.key?.id) {
                 firstSentId ??= sent.key.id;
                 if (sent.message) sentMessageCache.set(sent.key.id, sent.message);
@@ -1106,7 +1161,7 @@ registerChannelAdapter('whatsapp', {
         if (text) {
           const { text: formatted, mentions } = formatWhatsApp(text);
           const prefixed = WHATSAPP_SHARED ? `${ASSISTANT_NAME}: ${formatted}` : formatted;
-          return sendRawMessage(platformId, prefixed, mentions);
+          return sendRawMessage(platformId, prefixed, mentions, quoted);
         }
       },
 
