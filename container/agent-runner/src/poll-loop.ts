@@ -19,6 +19,7 @@ import {
 } from './db/session-state.js';
 import {
   formatMessages,
+  replyTargetReminder,
   extractRouting,
   categorizeMessage,
   isClearCommand,
@@ -326,6 +327,8 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
 
   if (normalBatch.length > 0) {
     parts.push(formatMessages(normalBatch));
+    const reminder = replyTargetReminder(normalBatch);
+    if (reminder) parts.push(reminder);
   }
 
   return parts.join('\n\n');
@@ -480,7 +483,8 @@ export async function processQuery(
         if (done) return;
 
         const keptIds = keep.map((m) => m.id);
-        const prompt = formatMessages(keep);
+        const reminder = replyTargetReminder(keep, true);
+        const prompt = reminder ? `${formatMessages(keep)}\n\n${reminder}` : formatMessages(keep);
         // The turn now answers more than one message, so the batch's own reply
         // target is no longer the right default for anything it sends: without
         // this, every later answer is stamped with whatever arrived first and

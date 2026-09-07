@@ -160,6 +160,31 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
  *
  * Strips routing fields — the agent never sees platform_id, channel_type, thread_id.
  */
+/**
+ * A reminder, in the prompt itself, to say which message each answer is for.
+ *
+ * Standing instructions were not enough on their own: told once at the top of a
+ * session that `replyTo` exists, an agent answering three questions still sent
+ * three unattached replies. The moment ambiguity actually arises is the moment
+ * to say so, naming the numbers it should use — an instruction next to the work
+ * beats an instruction in a preamble.
+ *
+ * Returns null when there is nothing to disambiguate: one message, or none that
+ * can be replied to at all (tasks, echoes, agent hand-offs).
+ */
+export function replyTargetReminder(messages: MessageInRow[], alsoEarlier = false): string | null {
+  const answerable = messages.filter(
+    (m) => (m.kind === 'chat' || m.kind === 'chat-sdk') && m.seq != null && m.platform_id && !isSessionEcho(m),
+  );
+  if (answerable.length === 0) return null;
+  if (answerable.length === 1 && !alsoEarlier) return null;
+  const ids = answerable.map((m) => `#${m.seq}`).join(', ');
+  const which = alsoEarlier
+    ? `${ids} arrived while you were working, on top of what you were already answering`
+    : `${ids} are all waiting on you`;
+  return `[${which}. Send each answer with \`replyTo\` set to the number of the message it answers — e.g. \`send_message({ to: …, text: …, replyTo: ${answerable[0].seq} })\` — so it is attached to the right question. An answer sent without it is attached to nothing.]`;
+}
+
 export function formatMessages(messages: MessageInRow[]): string {
   const header = `<context timezone="${escapeXml(TIMEZONE)}" />\n`;
   if (messages.length === 0) return header;
