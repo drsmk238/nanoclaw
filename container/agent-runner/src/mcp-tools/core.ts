@@ -10,7 +10,9 @@ import fs from 'fs';
 import path from 'path';
 
 import { findByName, getAllDestinations } from '../destinations.js';
-import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
+import { writeMessageOut } from '../db/messages-out.js';
+import { resolveReplyTo } from '../reply-target.js';
+import { getMessageIdBySeq, getRoutingBySeq } from '../db/messages-out.js';
 import { getCurrentInReplyTo } from '../db/session-state.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
@@ -79,6 +81,11 @@ export const sendMessage: McpToolDefinition = {
           description: 'Destination name (e.g., "family", "worker-1").',
         },
         text: { type: 'string', description: 'Message content' },
+        replyTo: {
+          type: 'integer',
+          description:
+            'The number of the message this answers (the #N shown beside it). Give it when you are answering one of several messages, so the reply is attached to the right question.',
+        },
       },
       required: ['to', 'text'],
     },
@@ -92,10 +99,13 @@ export const sendMessage: McpToolDefinition = {
     const routing = resolveRouting(to);
     if ('error' in routing) return err(routing.error);
 
+    const answering = resolveReplyTo(args.replyTo, routing.platform_id);
+    if (answering && 'error' in answering) return err(answering.error);
+
     const id = generateId();
     const seq = await writeMessageOut({
       id,
-      in_reply_to: getCurrentInReplyTo(),
+      in_reply_to: answering?.id ?? getCurrentInReplyTo(),
       kind: 'chat',
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
@@ -119,6 +129,10 @@ export const sendFile: McpToolDefinition = {
         path: { type: 'string', description: 'File path (relative to /workspace/agent/ or absolute)' },
         text: { type: 'string', description: 'Optional accompanying message' },
         filename: { type: 'string', description: 'Display name (default: basename of path)' },
+        replyTo: {
+          type: 'integer',
+          description: 'The number of the message this answers (the #N shown beside it), when it answers one in particular.',
+        },
       },
       required: ['to', 'path'],
     },
@@ -132,6 +146,9 @@ export const sendFile: McpToolDefinition = {
     const routing = resolveRouting(to);
     if ('error' in routing) return err(routing.error);
 
+    const answering = resolveReplyTo(args.replyTo, routing.platform_id);
+    if (answering && 'error' in answering) return err(answering.error);
+
     const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
     if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
 
@@ -144,7 +161,7 @@ export const sendFile: McpToolDefinition = {
 
     await writeMessageOut({
       id,
-      in_reply_to: getCurrentInReplyTo(),
+      in_reply_to: answering?.id ?? getCurrentInReplyTo(),
       kind: 'chat',
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,

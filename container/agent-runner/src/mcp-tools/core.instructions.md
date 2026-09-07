@@ -2,6 +2,19 @@
 
 The runtime system prompt lists your destinations and explains how final output is handled in this session. Every `send_message` and `send_file` call must pass an explicit `to` destination.
 
+### Answering one of several messages (`replyTo`)
+
+When a batch hands you two or more messages and you answer them separately, say
+which message each reply answers: `send_message({ to, text, replyTo: 12 })`,
+where `12` is the `#N` shown beside that message. The channel then attaches the
+answer to the right question — a quoted reply on WhatsApp, the right thread and
+subject on email. `send_file` takes `replyTo` too.
+
+Without it the reply is attached to nothing, because a turn that answers three
+questions cannot say which answer belongs to which. Answering a single message
+needs no `replyTo`; that one is worked out for you. Only a message from the
+conversation you are sending to can be named.
+
 ### Sending files (`send_file`)
 
 Use `mcp__nanoclaw__send_file({ to, path, text?, filename? })` to deliver a file from your workspace. `path` is absolute or relative to `/workspace/agent/`; `filename` overrides the display name shown in chat (defaults to the file's basename); `text` is an optional accompanying message. Use this for artifacts you produce (charts, PDFs, generated images, reports) rather than dumping contents into chat.
