@@ -14,6 +14,7 @@ import {
   renderAskQuestion,
   replySubject,
   shouldSkipInbound,
+  splitSubject,
   stripQuotedReply,
 } from './proton-mail.js';
 import { normalizeOptions } from './ask-question.js';
@@ -34,6 +35,35 @@ describe('replySubject', () => {
   it('handles a missing subject', () => {
     expect(replySubject(undefined)).toBe('Re: (no subject)');
     expect(replySubject('   ')).toBe('Re: (no subject)');
+  });
+});
+
+describe('splitSubject', () => {
+  it('lifts a leading Subject line out of the body', () => {
+    expect(splitSubject('Subject: Behaviour Policy 2026\n\nHere it is.')).toEqual({
+      subject: 'Behaviour Policy 2026',
+      body: 'Here it is.',
+    });
+  });
+
+  it('accepts a single newline after the subject', () => {
+    expect(splitSubject('Subject: Anti-Bullying Policy\nAttached.')).toEqual({
+      subject: 'Anti-Bullying Policy',
+      body: 'Attached.',
+    });
+  });
+
+  it('leaves an ordinary message alone, so replies keep inheriting Re: <thread>', () => {
+    expect(splitSubject('No subject line here.')).toEqual({ body: 'No subject line here.' });
+  });
+
+  it('ignores a Subject: that is not the first thing in the message', () => {
+    const text = 'Morning.\n\nSubject: not a header\n\nrest';
+    expect(splitSubject(text)).toEqual({ body: text });
+  });
+
+  it('ignores an empty subject rather than sending a blank one', () => {
+    expect(splitSubject('Subject:   \n\nbody')).toEqual({ body: 'Subject:   \n\nbody' });
   });
 });
 

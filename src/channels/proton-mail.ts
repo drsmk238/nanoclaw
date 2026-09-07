@@ -67,6 +67,22 @@ export function normalizeAddress(raw: string): string {
   return raw.trim().toLowerCase();
 }
 
+/**
+ * Outbound mirror of the inbound `Subject: …` convention. A message may open
+ * with a Subject line of its own to name the mail rather than inheriting
+ * "Re: <whatever this thread was last called>" — useful when the body is a
+ * document the reader will want to find again by name. Threading headers are
+ * kept either way, so a renamed mail still sits in its conversation.
+ */
+const SUBJECT_PREFIX = /^Subject:[ \t]*([^\n]{1,180})\n\n?/;
+
+export function splitSubject(text: string): { subject?: string; body: string } {
+  const m = SUBJECT_PREFIX.exec(text);
+  if (!m) return { body: text };
+  const subject = m[1].trim();
+  return subject ? { subject, body: text.slice(m[0].length) } : { body: text };
+}
+
 /** "Re: X" unless the subject already carries a reply prefix in a common locale. */
 export function replySubject(subject: string | undefined): string {
   const s = (subject ?? '').trim();
@@ -327,11 +343,12 @@ registerChannelAdapter('proton-mail', {
     ): Promise<string | undefined> {
       const addr = normalizeAddress(to);
       const thread = state.threads[addr];
+      const { subject: named, body } = splitSubject(text);
       const info = await getTransporter().sendMail({
         from: cfg.fromName ? { name: cfg.fromName, address: cfg.address } : cfg.address,
         to: addr,
-        subject: thread ? replySubject(thread.subject) : cfg.defaultSubject,
-        text,
+        subject: named ?? (thread ? replySubject(thread.subject) : cfg.defaultSubject),
+        text: body,
         attachments: files,
         headers: { 'X-NanoClaw-Agent': 'proton-mail' },
         ...(thread && { inReplyTo: thread.messageId, references: thread.references.join(' ') }),
@@ -343,7 +360,7 @@ registerChannelAdapter('proton-mail', {
         rememberThread(state, addr, {
           messageId: sentId,
           references: [...(thread?.references ?? []), sentId].slice(-20),
-          subject: thread?.subject ?? cfg.defaultSubject,
+          subject: named ?? thread?.subject ?? cfg.defaultSubject,
           name: thread?.name,
         });
         saveState(state);
