@@ -634,7 +634,7 @@ registerChannelAdapter('proton-mail', {
       async deliver(platformId: string, _threadId: string | null, message: OutboundMessage) {
         // Email conversations are identified by the mail being answered, not by
         // NanoClaw's thread id (this channel declares threads: false).
-        const answering = (message as { inReplyTo?: string | null }).inReplyTo ?? null;
+        const answering = message.inReplyTo ?? null;
         const content = message.content as Record<string, unknown>;
 
         if (content.type === 'ask_question' && content.questionId && content.options) {

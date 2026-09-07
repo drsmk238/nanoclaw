@@ -128,12 +128,18 @@ export interface RoutingContext {
  * happen — echo rows never trigger).
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
-  const first = messages.find((m) => !isSessionEcho(m)) ?? messages[0];
+  const real = messages.filter((m) => !isSessionEcho(m));
+  const first = real[0] ?? messages[0];
   return {
     platformId: first?.platform_id ?? null,
     channelType: first?.channel_type ?? null,
     threadId: first?.thread_id ?? null,
-    inReplyTo: first?.id ?? null,
+    // Which message the answer answers, used downstream to reply into the right
+    // conversation (email threading, a WhatsApp quote). Only claim it when the
+    // batch holds a single message: three questions answered in one turn all
+    // share this routing, so pointing every answer at the first of them would
+    // quote the wrong question. Better silent than wrong.
+    inReplyTo: real.length === 1 ? (first?.id ?? null) : null,
     // Echo rows riding along with a task must not disable one-door delivery:
     // taskRun as long as at least one task row and no non-task/non-echo row.
     taskRun:

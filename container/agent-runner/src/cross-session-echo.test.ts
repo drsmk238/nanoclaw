@@ -157,9 +157,24 @@ describe('routing (extractRouting)', () => {
     insertEcho('e2', { seq: 4 });
 
     const routing = extractRouting(getPendingMessages());
-    expect(routing.inReplyTo).toBe('e1');
+    // Routing still falls back to the first row, but an echo is never something
+    // to reply to, so there is no reply target to claim.
+    expect(routing.inReplyTo).toBeNull();
     expect(routing.platformId).toBeNull();
     expect(routing.taskRun).toBe(false);
+  });
+
+  it('claims no reply target when one turn answers several messages', () => {
+    // Three questions answered in one turn share this routing. Pointing every
+    // answer at the first of them would quote the wrong question, so the
+    // adapters get nothing to reply into rather than something wrong.
+    insertMessage('m1', 'chat', { sender: 'Steven', text: 'What divisions do I teach?' }, { seq: 2, platformId: '447', channelType: 'whatsapp' });
+    insertMessage('m2', 'chat', { sender: 'Steven', text: 'When is my next Greek lesson?' }, { seq: 4, platformId: '447', channelType: 'whatsapp' });
+    insertMessage('m3', 'chat', { sender: 'Steven', text: 'What is the weather tomorrow?' }, { seq: 6, platformId: '447', channelType: 'whatsapp' });
+
+    const routing = extractRouting(getPendingMessages());
+    expect(routing.platformId).toBe('447');
+    expect(routing.inReplyTo).toBeNull();
   });
 
   it('taskRun stays true when echo rows ride along with a task', () => {

@@ -103,6 +103,13 @@ export interface OutboundMessage {
   kind: string;
   content: unknown; // parsed JSON from messages_out
   files?: OutboundFile[]; // file attachments from the session outbox
+  /**
+   * The inbound message this one answers, as `<platform-message-id>:<group>`,
+   * or null when it answers nothing — a scheduled task, an agent-to-agent
+   * handoff. Adapters use it to reply into the right conversation: email
+   * threading, a WhatsApp quote.
+   */
+  inReplyTo?: string | null;
 }
 
 /** Discovered conversation info (from syncConversations). */

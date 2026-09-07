@@ -100,6 +100,9 @@ export interface ChannelDeliveryAdapter {
     /** Delivering adapter instance (defaults to channelType downstream).
      *  Host-internal only — containers never see instance. */
     instance?: string,
+    /** The inbound message this one answers, so an adapter can reply into the
+     *  right conversation (email threading, a WhatsApp quote). */
+    inReplyTo?: string | null,
   ): Promise<string | undefined>;
   setTyping?(
     channelType: string,
@@ -498,6 +501,7 @@ async function deliverMessage(
     msg.content,
     files,
     deliverInstance,
+    msg.inReplyTo,
   );
   log.info('Message delivered', {
     id: msg.id,

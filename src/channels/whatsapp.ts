@@ -1071,7 +1071,7 @@ registerChannelAdapter('whatsapp', {
       ): Promise<string | undefined> {
         const content = message.content as Record<string, unknown>;
         // Which of Steven's messages, if any, this one is answering.
-        const quoted = quoteFor(platformId, (message as { inReplyTo?: string | null }).inReplyTo);
+        const quoted = quoteFor(platformId, message.inReplyTo);
 
         // Ask question → text with slash command replies
         if (content.type === 'ask_question' && content.questionId && content.options) {
