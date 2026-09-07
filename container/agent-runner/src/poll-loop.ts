@@ -481,6 +481,13 @@ export async function processQuery(
 
         const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
+        // The turn now answers more than one message, so the batch's own reply
+        // target is no longer the right default for anything it sends: without
+        // this, every later answer is stamped with whatever arrived first and
+        // gets quoted against the wrong question. From here the agent must name
+        // the message each reply answers (`replyTo`), or the reply is attached
+        // to nothing.
+        setCurrentInReplyTo(null);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         taskBlockNudged = false;

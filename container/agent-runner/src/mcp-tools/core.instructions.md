@@ -4,16 +4,30 @@ The runtime system prompt lists your destinations and explains how final output 
 
 ### Answering one of several messages (`replyTo`)
 
-When a batch hands you two or more messages and you answer them separately, say
-which message each reply answers: `send_message({ to, text, replyTo: 12 })`,
-where `12` is the `#N` shown beside that message. The channel then attaches the
-answer to the right question — a quoted reply on WhatsApp, the right thread and
-subject on email. `send_file` takes `replyTo` too.
+Every message you are shown carries a number: `<message id="306" …>`. When more
+than one of them is outstanding, say which one each reply answers:
 
-Without it the reply is attached to nothing, because a turn that answers three
-questions cannot say which answer belongs to which. Answering a single message
-needs no `replyTo`; that one is worked out for you. Only a message from the
-conversation you are sending to can be named.
+```
+send_message({ to: "steven", text: "Tomorrow: rain, 14°C", replyTo: 306 })
+```
+
+The channel then attaches the answer to that question — a quoted reply on
+WhatsApp, the right thread and subject on email. `send_file` takes it too.
+
+This matters more often than it looks. Messages **arrive while you are still
+working**: you may begin with one question, have two more land mid-turn, and
+answer all three. From the moment a second message is in play, nothing is
+attached for you — a reply sent without `replyTo` is attached to nothing, and
+one sent with the wrong number is quoted against the wrong question, which is
+worse. So:
+
+- Answering the only message you were given: no `replyTo` needed.
+- Answering any one of several, including messages that arrived after you
+  started: pass its `id`.
+- Sending something nobody asked for (a scheduled check, a hand-off): no
+  `replyTo` — it answers nothing.
+
+Only a message from the conversation you are sending to can be named.
 
 ### Sending files (`send_file`)
 

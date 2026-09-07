@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './mailbox/sqlite/connection.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
+import { getCurrentInReplyTo, setCurrentInReplyTo } from './db/session-state.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import { processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
@@ -506,6 +507,61 @@ describe('task-run turn wiring (real processQuery)', () => {
     // and nothing was delivered as chat
     expect(getUndeliveredMessages().filter((m) => m.kind === 'chat')).toHaveLength(0);
   });
+
+  it('stops attaching replies to the first message once a follow-up joins the turn', async () => {
+    // Steven asks one thing, then more while the answer is still being worked
+    // out. The turn began with a single message, so its reply target was that
+    // first question — leaving it in place stamped every later answer with it,
+    // and each came back quoted against the wrong question.
+    const pushes: string[] = [];
+    const seen: Array<string | null> = [];
+
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 's1' };
+      seen.push(getCurrentInReplyTo());
+
+      insertMessage('q2', 'chat', { sender: 'Steven', text: 'and when is my next Greek lesson?' });
+
+      const deadline = Date.now() + 15_000;
+      while (pushes.length === 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      if (pushes.length === 0) throw new Error('follow-up poller never pushed the second question');
+
+      seen.push(getCurrentInReplyTo());
+      yield { type: 'result', text: 'answered both' };
+    }
+
+    const query: AgentQuery = {
+      push: (m: string) => {
+        pushes.push(m);
+      },
+      end: () => {},
+      events: events(),
+      abort: () => {},
+    };
+
+    insertMessage('q1', 'chat', { sender: 'Steven', text: 'what divisions do I teach?' });
+    markCompleted(['q1']);
+    // The poll loop publishes the batch's target before opening the query; this
+    // test drives processQuery directly, so stand that step in.
+    setCurrentInReplyTo('q1');
+    await processQuery(
+      query,
+      { platformId: '447', channelType: 'whatsapp', threadId: null, inReplyTo: 'q1', taskRun: false },
+      ['q1'],
+      'claude',
+      undefined,
+      'prompt',
+      undefined,
+    );
+
+    // Answering the one question it was given: that question is the target.
+    expect(seen[0]).toBe('q1');
+    // A second question joined the turn: no single default is right any more,
+    // so nothing is attached unless the agent names a message itself.
+    expect(seen[1]).toBeNull();
+  }, 20_000);
 
   it('logs and conditionally nudges a second task run in the same open query', async () => {
     const pushes: string[] = [];
