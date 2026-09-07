@@ -356,3 +356,61 @@ describe('channel + router integration', () => {
     expect((mockAdapter.delivered[0].content as { text: string }).text).toBe('Agent response');
   });
 });
+
+describe('channel delivery adapter — the message being answered', () => {
+  // The adapters were handed { kind, content, files } and nothing else, so
+  // inReplyTo never arrived and every conversation feature built on it was
+  // silently inert. Guard the seam.
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    const { teardownChannelAdapters } = await import('./channel-registry.js');
+    await teardownChannelAdapters();
+    vi.resetModules();
+  });
+
+  const mockSetup = () => ({
+    onInbound: () => {},
+    onInboundEvent: () => {},
+    onMetadata: () => {},
+    onAction: () => {},
+  });
+
+  it('hands the adapter the inbound message a reply answers', async () => {
+    const reg = await import('./channel-registry.js');
+    const wa = createMockAdapter('whatsapp');
+    reg.registerChannelAdapter('whatsapp', { factory: () => wa });
+    await reg.initChannelAdapters(mockSetup);
+
+    await reg
+      .createChannelDeliveryAdapter()
+      .deliver(
+        'whatsapp',
+        '447@s.whatsapp.net',
+        null,
+        'chat',
+        JSON.stringify({ text: 'hi' }),
+        undefined,
+        undefined,
+        '3A21A10A5B609BC5AC9E:ag-1',
+      );
+
+    expect(wa.delivered).toHaveLength(1);
+    expect(wa.delivered[0].inReplyTo).toBe('3A21A10A5B609BC5AC9E:ag-1');
+  });
+
+  it('passes null when the message answers nothing — a task, a handoff', async () => {
+    const reg = await import('./channel-registry.js');
+    const wa = createMockAdapter('whatsapp');
+    reg.registerChannelAdapter('whatsapp', { factory: () => wa });
+    await reg.initChannelAdapters(mockSetup);
+
+    await reg
+      .createChannelDeliveryAdapter()
+      .deliver('whatsapp', '447@s.whatsapp.net', null, 'chat', JSON.stringify({ text: 'hi' }));
+
+    expect(wa.delivered[0].inReplyTo).toBeNull();
+  });
+});
