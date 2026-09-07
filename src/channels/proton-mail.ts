@@ -214,16 +214,29 @@ interface ThreadRef {
 interface AdapterState {
   uidValidity?: number;
   lastUid?: number;
+  /** Per correspondent, only so a display name is available. */
   threads: Record<string, ThreadRef>;
+  /**
+   * Per conversation, keyed by the inbound mail this agent is answering. One
+   * correspondent has many conversations at once — a policy question, a Latin
+   * unseen, a scheduled task — and a reply must go back into the one it
+   * answers, not into whichever mail happened to arrive most recently.
+   */
+  byMessage?: Record<string, ThreadRef>;
 }
 
 function loadState(): AdapterState {
   try {
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8')) as Partial<AdapterState>;
-    return { uidValidity: raw.uidValidity, lastUid: raw.lastUid, threads: raw.threads ?? {} };
+    return {
+      uidValidity: raw.uidValidity,
+      lastUid: raw.lastUid,
+      threads: raw.threads ?? {},
+      byMessage: raw.byMessage ?? {},
+    };
   } catch (err) {
     log.debug('No Proton Mail adapter state yet, starting fresh', { err });
-    return { threads: {} };
+    return { threads: {}, byMessage: {} };
   }
 }
 
@@ -233,6 +246,30 @@ function saveState(state: AdapterState): void {
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
   } catch (err) {
     log.error('Failed to persist Proton Mail adapter state', { err });
+  }
+}
+
+/**
+ * The router hands an inbound mail to the agent as `<rfc-message-id>:<group>`,
+ * and the reply comes back naming that id. Strip the group to get back to the
+ * mail itself. Anything that is not an inbound mail id — an agent-to-agent
+ * handoff (`a2a-…`), a task, a null — has no conversation to rejoin.
+ */
+export function conversationKey(inReplyTo: string | null | undefined): string | null {
+  if (!inReplyTo) return null;
+  const id = inReplyTo.replace(/:ag-[^:]*$/, '');
+  return id.startsWith('<') ? id : null;
+}
+
+function rememberConversation(state: AdapterState, key: string, ref: Omit<ThreadRef, 'at'>): void {
+  const map = (state.byMessage ??= {});
+  map[key] = { ...ref, at: new Date().toISOString() };
+  const keys = Object.keys(map);
+  if (keys.length > THREADS_MAX) {
+    keys
+      .sort((a, b) => map[a].at.localeCompare(map[b].at))
+      .slice(0, keys.length - THREADS_MAX)
+      .forEach((k) => delete map[k]);
   }
 }
 
@@ -340,9 +377,15 @@ registerChannelAdapter('proton-mail', {
       to: string,
       text: string,
       files: Array<{ filename: string; content: Buffer }> = [],
+      inReplyTo?: string | null,
     ): Promise<string | undefined> {
       const addr = normalizeAddress(to);
-      const thread = state.threads[addr];
+      // Only a reply to a real inbound mail joins an existing conversation.
+      // Work started by a task or handed over by another agent is new mail: it
+      // answers nothing, so inheriting the last correspondence would put, say,
+      // a Latin unseen under "Re: Policy question".
+      const key = conversationKey(inReplyTo);
+      const thread = key ? state.byMessage?.[key] : undefined;
       const { subject: named, body } = splitSubject(text);
       const info = await getTransporter().sendMail({
         from: cfg.fromName ? { name: cfg.fromName, address: cfg.address } : cfg.address,
@@ -354,14 +397,14 @@ registerChannelAdapter('proton-mail', {
         ...(thread && { inReplyTo: thread.messageId, references: thread.references.join(' ') }),
       });
       const sentId: string | undefined = info?.messageId;
-      if (sentId) {
-        // Chain our own message into the thread so the next agent-initiated
-        // mail (a scheduled task, say) lands in the same conversation.
-        rememberThread(state, addr, {
+      if (sentId && key && thread) {
+        // Chain our own message into *this* conversation, so a second reply to
+        // the same mail continues it rather than starting again.
+        rememberConversation(state, key, {
           messageId: sentId,
-          references: [...(thread?.references ?? []), sentId].slice(-20),
-          subject: named ?? thread?.subject ?? cfg.defaultSubject,
-          name: thread?.name,
+          references: [...thread.references, sentId].slice(-20),
+          subject: named ?? thread.subject,
+          name: thread.name,
         });
         saveState(state);
       }
@@ -397,12 +440,16 @@ registerChannelAdapter('proton-mail', {
 
       // Thread bookkeeping happens before the question check so a confirmation
       // reply threads correctly too.
-      rememberThread(state, fromAddr, {
+      const threadRef = {
         messageId,
         references: [...(parsed.references ? [parsed.references].flat() : []), messageId].slice(-20),
         subject,
         name: from.name,
-      });
+      };
+      // By address, so a display name is available; by message id, so the reply
+      // to *this* mail can find its way back to *this* conversation.
+      rememberThread(state, fromAddr, threadRef);
+      rememberConversation(state, messageId, threadRef);
 
       const pending = pendingQuestions.get(fromAddr);
       if (pending) {
@@ -585,6 +632,9 @@ registerChannelAdapter('proton-mail', {
       },
 
       async deliver(platformId: string, _threadId: string | null, message: OutboundMessage) {
+        // Email conversations are identified by the mail being answered, not by
+        // NanoClaw's thread id (this channel declares threads: false).
+        const answering = (message as { inReplyTo?: string | null }).inReplyTo ?? null;
         const content = message.content as Record<string, unknown>;
 
         if (content.type === 'ask_question' && content.questionId && content.options) {
@@ -596,7 +646,7 @@ registerChannelAdapter('proton-mail', {
           }
           const options = normalizeOptions(content.options as never);
           const text = renderAskQuestion(title, content.question as string, options);
-          const id = await sendMail(platformId, text);
+          const id = await sendMail(platformId, text, [], answering);
           if (id) {
             pendingQuestions.set(normalizeAddress(platformId), { questionId, options });
             if (pendingQuestions.size > PENDING_QUESTIONS_MAX) {
@@ -612,7 +662,7 @@ registerChannelAdapter('proton-mail', {
         const text = ((content.markdown as string) || (content.text as string) || '').trim();
         const files = (message.files ?? []).map((f) => ({ filename: f.filename, content: f.data }));
         if (!text && files.length === 0) return;
-        return sendMail(platformId, text || '(see attached)', files);
+        return sendMail(platformId, text || '(see attached)', files, answering);
       },
 
       async teardown() {

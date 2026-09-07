@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 
 import {
   classifyAttachment,
+  conversationKey,
   htmlToText,
   matchCommandReply,
   normalizeAddress,
@@ -35,6 +36,35 @@ describe('replySubject', () => {
   it('handles a missing subject', () => {
     expect(replySubject(undefined)).toBe('Re: (no subject)');
     expect(replySubject('   ')).toBe('Re: (no subject)');
+  });
+});
+
+describe('conversationKey', () => {
+  it('recovers the mail id from a reply to an inbound email', () => {
+    expect(conversationKey('<abc@proton.me>:ag-1788625605264-zt8hdp')).toBe('<abc@proton.me>');
+  });
+
+  it('accepts a bare mail id', () => {
+    expect(conversationKey('<abc@proton.me>')).toBe('<abc@proton.me>');
+  });
+
+  it('refuses an agent-to-agent handoff — it answers no email', () => {
+    expect(conversationKey('a2a-1788758958685-w00rtw')).toBeNull();
+  });
+
+  it('refuses a task or scheduled-run id', () => {
+    expect(conversationKey('task-1788694283403-7bcix5')).toBeNull();
+    expect(conversationKey('msg-1788760133645-156fbo:echo:sess-1788672164199-30dho1')).toBeNull();
+  });
+
+  it('refuses nothing at all', () => {
+    expect(conversationKey(null)).toBeNull();
+    expect(conversationKey(undefined)).toBeNull();
+    expect(conversationKey('')).toBeNull();
+  });
+
+  it('leaves a colon inside the mail id alone', () => {
+    expect(conversationKey('<a:b@proton.me>:ag-xyz')).toBe('<a:b@proton.me>');
   });
 });
 
