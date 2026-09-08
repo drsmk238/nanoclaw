@@ -48,3 +48,6 @@ AGENTS.md
 docs/maintainer-guide.md
 docs/drafts/
 forks.md
+
+# Personal Claude Code overrides (per-machine permission rules)
+.claude/settings.local.json
