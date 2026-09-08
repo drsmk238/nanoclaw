@@ -29,6 +29,7 @@ import {
   type RoutingContext,
 } from './formatter.js';
 import { stripHarnessTagArtifacts } from './harness-tag-strip.js';
+import { resolveReplyTo } from './reply-target.js';
 import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 
@@ -834,12 +835,13 @@ export async function deliverMidTurnBlocks(
   // door always treated it.
   const segStartSeq = turnStartSeq === undefined ? 0 : maxOutboundSeq();
   const visible = settled.replace(INTERNAL_SPAN_RE, '');
-  const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
+  const MESSAGE_RE = new RegExp(MESSAGE_BLOCK_RE.source, MESSAGE_BLOCK_RE.flags);
   let match: RegExpExecArray | null;
   let delivered = 0;
   while ((match = MESSAGE_RE.exec(visible)) !== null) {
     const toName = match[1];
-    const rawBody = match[2];
+    const replyToAttr = readReplyToAttr(match[2]);
+    const rawBody = match[3];
     const body = stripHarnessTagArtifacts(rawBody.trim());
     const dest = findByName(toName);
     if (!dest) continue;
@@ -862,11 +864,30 @@ export async function deliverMidTurnBlocks(
       log(`Mid-turn <message to="${toName}"> is a verbatim repeat of a message already sent this turn — skipped`);
       continue;
     }
-    await sendToDestination(dest, body, routing);
+    await sendToDestination(dest, body, routing, replyToAttr);
     delivered++;
     log(`Mid-turn delivery: <message to="${toName}"> (${body.length} chars)`);
   }
   return { delivered, tail };
+}
+
+/**
+ * A complete <message> block. Attributes other than `to` are tolerated on the
+ * open tag: the agent is told (see formatter.ts) to answer with `replyTo` set,
+ * and it naturally writes that as an attribute here rather than as a
+ * send_message argument. A pattern that only allowed `to` matched no such
+ * block at all, so every reply carrying `replyTo` was silently dropped and the
+ * agent was nudged to re-send a message it had in fact composed correctly.
+ */
+const MESSAGE_BLOCK_RE = /<message\s+to="([^"]+)"([^>]*)>([\s\S]*?)<\/message>/g;
+
+/**
+ * The `replyTo` (or `reply_to`) attribute of a <message> open tag, if it
+ * carries one — the number of the inbound message this block answers.
+ */
+function readReplyToAttr(attrs: string): string | null {
+  const m = /\breply_?[Tt]o\s*=\s*"([^"]*)"/.exec(attrs);
+  return m ? m[1] : null;
 }
 
 const OPEN_INTERNAL_RE = /<internal\b/i;
@@ -988,7 +1009,7 @@ export async function dispatchResultText(
   // never reaches the user (the closing stripInternalTags pass removed it from
   // the scratchpad already), so nudge/scratchpad semantics are unchanged.
   text = text.replace(INTERNAL_SPAN_RE, '');
-  const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
+  const MESSAGE_RE = new RegExp(MESSAGE_BLOCK_RE.source, MESSAGE_BLOCK_RE.flags);
 
   let match: RegExpExecArray | null;
   // Blocks delivered mid-turn count toward this turn's sent total — a final
@@ -1010,7 +1031,8 @@ export async function dispatchResultText(
       scratchpadParts.push(text.slice(lastIndex, match.index));
     }
     const toName = match[1];
-    const body = stripHarnessTagArtifacts(match[2].trim());
+    const replyToAttr = readReplyToAttr(match[2]);
+    const body = stripHarnessTagArtifacts(match[3].trim());
     lastIndex = MESSAGE_RE.lastIndex;
     resultBlocks++;
 
@@ -1058,7 +1080,7 @@ export async function dispatchResultText(
       }
       continue;
     }
-    await sendToDestination(dest, body, routing);
+    await sendToDestination(dest, body, routing, replyToAttr);
     sent++;
   }
   if (lastIndex < text.length) {
@@ -1129,8 +1151,8 @@ export async function autoAppendTaskLog(text: string): Promise<void> {
   // raw XML — replace each with its inner text, marked undelivered, so the
   // log stays readable prose.
   const prose = text.replace(
-    /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g,
-    (_m, to: string, body: string) => `[undelivered → ${to}] ${body.trim()}`,
+    new RegExp(MESSAGE_BLOCK_RE.source, MESSAGE_BLOCK_RE.flags),
+    (_m, to: string, _attrs: string, body: string) => `[undelivered → ${to}] ${body.trim()}`,
   );
   const line = stripInternalTags(prose).replace(/\s+/g, ' ').trim().slice(0, 500);
   if (!line) return;
@@ -1142,7 +1164,12 @@ export async function autoAppendTaskLog(text: string): Promise<void> {
   log('Task run log auto-appended from final text');
 }
 
-async function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): Promise<void> {
+async function sendToDestination(
+  dest: DestinationEntry,
+  body: string,
+  routing: RoutingContext,
+  replyTo?: string | null,
+): Promise<void> {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
   // Resolve thread_id per-destination from the most recent inbound message
@@ -1150,9 +1177,18 @@ async function sendToDestination(dest: DestinationEntry, body: string, routing: 
   // different destinations have different thread contexts — using a single
   // routing.threadId would stamp one channel's thread onto another.
   const destRouting = resolveDestinationThread(channelType, platformId);
+  // An answer that names the message it answers is attached to it. A target
+  // that will not resolve (not a message this conversation was shown) is not
+  // worth failing a composed reply over — the message still goes, attached to
+  // the turn's own default, and the mismatch is logged.
+  const answering = resolveReplyTo(replyTo, dest.type === 'channel' ? platformId : null);
+  if (answering && 'error' in answering) {
+    log(`<message to="${dest.name}"> replyTo="${replyTo}" not usable (${answering.error}) — sending unattached`);
+  }
+  const attached = answering && 'id' in answering ? answering.id : null;
   await writeMessageOut({
     id: generateId(),
-    in_reply_to: destRouting?.inReplyTo ?? routing.inReplyTo,
+    in_reply_to: attached ?? destRouting?.inReplyTo ?? routing.inReplyTo,
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
