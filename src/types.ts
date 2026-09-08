@@ -15,6 +15,8 @@ export interface ContainerConfigRow {
   agent_group_id: string;
   provider: string | null;
   model: string | null;
+  /** Model tried when `model` is overloaded or unavailable; NULL = no fallback. */
+  fallback_model: string | null;
   effort: string | null;
   image_tag: string | null;
   assistant_name: string | null;

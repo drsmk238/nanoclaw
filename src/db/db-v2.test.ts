@@ -477,6 +477,7 @@ describe('container configs', () => {
       additional_mounts: '[]',
       cli_scope: 'global',
       timezone: null,
+      fallback_model: null,
       updated_at: now(),
     });
     const row = await getContainerConfig('ag-full');

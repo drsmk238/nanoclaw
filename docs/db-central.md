@@ -316,6 +316,7 @@ CREATE TABLE container_configs (
   agent_group_id         TEXT PRIMARY KEY REFERENCES agent_groups(id) ON DELETE CASCADE,
   provider               TEXT,
   model                  TEXT,
+  fallback_model         TEXT,      -- tried when model is overloaded/unavailable; NULL = none
   effort                 TEXT,
   image_tag              TEXT,
   assistant_name         TEXT,

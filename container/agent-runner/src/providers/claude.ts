@@ -484,6 +484,7 @@ export class ClaudeProvider implements AgentProvider {
   private additionalDirectories?: string[];
   private model?: string;
   private effort?: string;
+  private fallbackModel?: string;
   private fastMode?: boolean;
   private memorySessionHook?: MemorySessionHookRegistration;
 
@@ -495,6 +496,7 @@ export class ClaudeProvider implements AgentProvider {
     this.additionalDirectories = options.additionalDirectories;
     this.model = options.model;
     this.effort = options.effort;
+    this.fallbackModel = options.fallbackModel;
     this.fastMode = options.fastMode;
     this.env = {
       ...(options.env ?? {}),
@@ -569,6 +571,7 @@ export class ClaudeProvider implements AgentProvider {
         disallowedTools: SDK_DISALLOWED_TOOLS,
         env: this.env,
         model: this.model,
+        fallbackModel: this.fallbackModel,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         effort: this.effort as any,
         permissionMode: 'bypassPermissions',

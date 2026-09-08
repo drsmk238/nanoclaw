@@ -5,6 +5,7 @@ import { getDb } from './connection.js';
 const SCALAR_COLUMNS = new Set([
   'provider',
   'model',
+  'fallback_model',
   'effort',
   'image_tag',
   'assistant_name',
@@ -26,11 +27,11 @@ export async function getAllContainerConfigs(): Promise<ContainerConfigRow[]> {
 export async function createContainerConfig(config: ContainerConfigRow): Promise<void> {
   await getDb().run(
     `INSERT INTO container_configs (
-        agent_group_id, provider, model, effort, image_tag, assistant_name,
+        agent_group_id, provider, model, fallback_model, effort, image_tag, assistant_name,
         max_messages_per_prompt, skills, mcp_servers, packages_apt, packages_npm,
         additional_mounts, cli_scope, timezone, updated_at
       ) VALUES (
-        @agent_group_id, @provider, @model, @effort, @image_tag, @assistant_name,
+        @agent_group_id, @provider, @model, @fallback_model, @effort, @image_tag, @assistant_name,
         @max_messages_per_prompt, @skills, @mcp_servers, @packages_apt, @packages_npm,
         @additional_mounts, @cli_scope, @timezone, @updated_at
       )`,
@@ -80,6 +81,7 @@ export async function updateContainerConfigScalars(
       ContainerConfigRow,
       | 'provider'
       | 'model'
+      | 'fallback_model'
       | 'effort'
       | 'image_tag'
       | 'assistant_name'

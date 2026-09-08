@@ -248,6 +248,8 @@ export interface ContainerConfig {
   agentGroupId?: string;
   maxMessagesPerPrompt?: number;
   model?: string;
+  /** Model the provider tries when `model` is overloaded or unavailable. */
+  fallbackModel?: string;
   effort?: string;
   /** API fast serving tier for this container; absent = the provider default. */
   fastMode?: boolean;
@@ -373,6 +375,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     // The group's own model wins; NANOCLAW_DEFAULT_MODEL fills in for groups
     // that have none. Both absent leaves the field out and the SDK decides.
     model: row.model ?? (DEFAULT_MODEL || undefined),
+    fallbackModel: row.fallback_model ?? undefined,
     effort: row.effort ?? undefined,
     fastMode: FAST_MODE || undefined,
     timezone: row.timezone && isValidTimezone(row.timezone) ? row.timezone : undefined,

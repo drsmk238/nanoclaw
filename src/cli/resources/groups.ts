@@ -58,6 +58,7 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     agent_group_id: row.agent_group_id,
     provider: row.provider,
     model: row.model,
+    fallback_model: row.fallback_model,
     effort: row.effort,
     image_tag: row.image_tag,
     assistant_name: row.assistant_name,
@@ -371,7 +372,8 @@ registerResource({
       access: 'approval',
       description:
         'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, ' +
+        'Use --id <group-id> and any of: --provider, --model, --fallback-model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, ' +
+        '--fallback-model is tried when --model is overloaded or unavailable ("" clears it); ' +
         '--timezone (IANA id like "Europe/Lisbon"; "" clears back to the install default; scheduled-task times follow it immediately, message display after restart).',
       handler: async (args) => {
         const id = args.id as string;
@@ -384,6 +386,7 @@ registerResource({
             ContainerConfigRow,
             | 'provider'
             | 'model'
+            | 'fallback_model'
             | 'effort'
             | 'image_tag'
             | 'assistant_name'
@@ -396,6 +399,10 @@ registerResource({
         const timezone = parseTimezoneFlag(args.timezone);
         if (timezone !== undefined) updates.timezone = timezone;
         if (args.model !== undefined) updates.model = args.model as string;
+        if (args.fallback_model !== undefined || args['fallback-model'] !== undefined) {
+          const fb = (args.fallback_model ?? args['fallback-model']) as string;
+          updates.fallback_model = fb === '' ? null : fb;
+        }
         if (args.effort !== undefined) updates.effort = args.effort as string;
         if (args.image_tag !== undefined) updates.image_tag = args.image_tag as string;
         if (args.assistant_name !== undefined) updates.assistant_name = args.assistant_name as string;
@@ -411,7 +418,7 @@ registerResource({
 
         if (Object.keys(updates).length === 0) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone',
+            'Nothing to update — provide at least one of: --provider, --model, --fallback-model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope, --timezone',
           );
         }
 
