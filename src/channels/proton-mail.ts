@@ -91,14 +91,29 @@ export function replySubject(subject: string | undefined): string {
   return `Re: ${s}`;
 }
 
+/** Subject prefixes mail clients add when forwarding, across common locales. */
+const FORWARD_SUBJECT = /^(fw|fwd|wg|tr|vs|vb|rv|enc|doorst|i)\s*:/i;
+const FORWARD_MARKER = /^(-{2,}\s*Forwarded message\s*-{2,}|Begin forwarded message:)$/i;
+
+export function isForwardSubject(subject: string | undefined): boolean {
+  return FORWARD_SUBJECT.test((subject ?? '').trim());
+}
+
 /**
  * Drop the quoted history a mail client appends to a reply: everything from
  * the "On … wrote:" / "-----Original Message-----" marker on, plus any trailing
  * `>`-quoted lines. Returns the original when stripping would leave nothing —
  * a message that is only a quote is still a message.
+ *
+ * A forward is the opposite case: the mail underneath the sender's note is the
+ * payload, not history. Outlook renders a forward exactly like a reply (a rule
+ * and a From:/Sent: block), so the subject prefix — or an explicit "Forwarded
+ * message" marker — decides, and the whole body is kept.
  */
-export function stripQuotedReply(text: string): string {
-  const lines = text.replace(/\r\n/g, '\n').split('\n');
+export function stripQuotedReply(text: string, subject?: string): string {
+  const normalized = text.replace(/\r\n/g, '\n');
+  if (isForwardSubject(subject)) return normalized.trim();
+  const lines = normalized.split('\n');
   const nextNonEmpty = (from: number): string => {
     for (let j = from; j < lines.length; j++) {
       const t = lines[j].trim();
@@ -109,10 +124,10 @@ export function stripQuotedReply(text: string): string {
   let cut = lines.length;
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
+    if (FORWARD_MARKER.test(line)) return normalized.trim();
     if (
       /^On\b.*\bwrote:\s*$/.test(line) ||
       /^-{2,}\s*Original Message\s*-{2,}$/i.test(line) ||
-      /^-{2,}\s*Forwarded message\s*-{2,}$/i.test(line) ||
       /^_{5,}$/.test(line) ||
       // Outlook (web/mobile): a bare rule, then a From:/Sent: header block.
       (/^-{10,}$/.test(line) && /^From:\s/i.test(nextNonEmpty(i + 1))) ||
@@ -430,11 +445,11 @@ registerChannelAdapter('proton-mail', {
       }
 
       const rawText = parsed.text || (parsed.html ? htmlToText(parsed.html) : '');
-      let body = stripQuotedReply(rawText);
+      const subject = parsed.subject?.trim() || undefined;
+      let body = stripQuotedReply(rawText, subject);
       if (body.length > BODY_MAX_CHARS) {
         body = body.slice(0, BODY_MAX_CHARS) + `\n\n[… truncated, ${rawText.length} characters in total]`;
       }
-      const subject = parsed.subject?.trim() || undefined;
       const senderName = from.name || fromAddr;
       const messageId = parsed.messageId || `<mail-${uid}@nanoclaw.local>`;
 

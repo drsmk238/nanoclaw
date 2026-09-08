@@ -126,6 +126,29 @@ describe('stripQuotedReply', () => {
   it('keeps a message that is only a quote', () => {
     expect(stripQuotedReply('> just forwarding this\n> as is')).toBe('> just forwarding this\n> as is');
   });
+  it('keeps the forwarded mail under an Outlook forward', () => {
+    const text =
+      'Can you check whether the event below exists?\r\n\r\n' +
+      'From: Colleague <c@school.org>\r\nSent: 08 September 2026 06:10\r\nTo: Kennedy, Dr S M\r\n' +
+      'Subject: Architecture / Tea Society Joint Presentation\r\n\r\nDear all, the talk is on 6 October.';
+    expect(stripQuotedReply(text, 'FW: Architecture / Tea Society Joint Presentation')).toBe(
+      text.replace(/\r\n/g, '\n'),
+    );
+  });
+  it('recognises forward prefixes in other locales and casing', () => {
+    const text = 'Note\n\nFrom: A <a@x.com>\nDate: Mon\nSubject: hi\n\nold';
+    for (const subject of ['Fwd: hi', 'fw: hi', 'WG: hi', 'TR: hi']) {
+      expect(stripQuotedReply(text, subject)).toBe(text);
+    }
+  });
+  it('keeps everything from a "Forwarded message" marker even without a subject prefix', () => {
+    const text = 'See this.\n\n---------- Forwarded message ---------\nFrom: A <a@x.com>\nDate: Mon\n\nthe body';
+    expect(stripQuotedReply(text, 'Interesting')).toBe(text);
+  });
+  it('still strips a reply to a forward', () => {
+    const text = 'Thanks, that is right.\n\nFrom: Agent <agent@x.com>\nSent: Mon\nSubject: RE: FW: hi\n\nold';
+    expect(stripQuotedReply(text, 'RE: FW: hi')).toBe('Thanks, that is right.');
+  });
 });
 
 describe('htmlToText', () => {
