@@ -36,6 +36,7 @@
  * would be silently ignored when written to the file where every other
  * NanoClaw setting lives.
  */
+import net from 'net';
 import os from 'os';
 import path from 'path';
 
@@ -60,11 +61,61 @@ import type { MountPolicy, SessionDriver, SessionSpec } from './types.js';
 
 const DEFAULT_DRIVER_KIND = 'docker';
 
-const SETTINGS = ['NANOCLAW_RUNTIME_DRIVER', 'NANOCLAW_SESSION_MATERIAL_ROOT'] as const;
+const SETTINGS = ['NANOCLAW_RUNTIME_DRIVER', 'NANOCLAW_SESSION_MATERIAL_ROOT', 'NANOCLAW_EXTRA_HOSTS'] as const;
 
 /** `process.env` wins, then `.env`, then the default. */
 export function readSetting(key: (typeof SETTINGS)[number], env: NodeJS.ProcessEnv = process.env): string {
   return env[key]?.trim() || readEnvFile([...SETTINGS])[key]?.trim() || '';
+}
+
+/** Labels separated by dots, each alphanumeric with interior hyphens. */
+const HOSTNAME_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
+
+/**
+ * Hostnames that must resolve inside a container but cannot be resolved by the
+ * container's DNS. The case this exists for: an install on a network whose
+ * internal services are published under public names that resolve, from
+ * outside, to addresses the local firewall will not route back inward (no NAT
+ * hairpin). The host can be fixed with `/etc/hosts`; containers cannot, because
+ * Docker generates each container's `/etc/hosts` from scratch rather than
+ * copying the host's — only `resolv.conf` is inherited. So the mapping has to
+ * be handed to the runtime per spawn.
+ *
+ * Format mirrors Docker's own `--add-host`: comma- or whitespace-separated
+ * `name:address` pairs.
+ *
+ *   NANOCLAW_EXTRA_HOSTS=intranet.example.org:10.0.1.204,mail.example.org:10.12.0.114
+ *
+ * Split on the FIRST colon, not the last: a hostname cannot contain one, so
+ * everything after it is the address and bare IPv6 literals survive intact.
+ *
+ * A malformed entry is warned about and skipped rather than thrown, unlike a
+ * malformed driver kind above. The asymmetry is deliberate: an unrecognized
+ * driver silently runs the wrong runtime, whereas a dropped host mapping omits
+ * one name. Throwing here would turn a typo in an operator's hosts list into a
+ * host crash loop that takes every channel down with it, which is the worse
+ * failure by a wide margin. The accepted set is logged at spawn so what the
+ * runtime actually received is visible without re-deriving it from `.env`.
+ */
+export function extraHostArgs(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = readSetting('NANOCLAW_EXTRA_HOSTS', env);
+  if (!raw) return [];
+
+  const args: string[] = [];
+  for (const entry of raw.split(/[,\s]+/).filter(Boolean)) {
+    const colon = entry.indexOf(':');
+    const name = colon === -1 ? '' : entry.slice(0, colon);
+    const address = colon === -1 ? '' : entry.slice(colon + 1);
+    // `host-gateway` is Docker's own magic value for "the host", already used
+    // below; accept it here too so the variable can express the same mapping.
+    const addressOk = address === 'host-gateway' || net.isIP(address) !== 0;
+    if (!name || !addressOk || !HOSTNAME_RE.test(name) || name.length > 253) {
+      log.warn('Ignoring malformed NANOCLAW_EXTRA_HOSTS entry', { entry, expected: 'name:address' });
+      continue;
+    }
+    args.push(`--add-host=${name}:${address}`);
+  }
+  return args;
 }
 
 /**
@@ -74,13 +125,26 @@ export function readSetting(key: (typeof SETTINGS)[number], env: NodeJS.ProcessE
  * registration — the driver stays constructible without it in tests, and
  * composition never sees an argv-shaped network selection: `spec.network`
  * states the intent, this realizes it, and nothing rides between them.
+ *
+ * `NANOCLAW_EXTRA_HOSTS` rides along in both branches because a name-to-address
+ * mapping is orthogonal to topology: `--add-host` writes a line in the
+ * container's `/etc/hosts` and grants no reachability of its own, so it neither
+ * widens egress under lockdown nor depends on the host-gateway mapping.
  */
 function dockerNetworkArgs(spec: SessionSpec): string[] {
+  const extraHosts = extraHostArgs();
+  if (extraHosts.length > 0) {
+    log.info('Injecting extra container host mappings', {
+      containerName: agentContainerName(spec),
+      hosts: extraHosts.map((arg) => arg.replace('--add-host=', '')),
+    });
+  }
   if (ensureEgressNetwork()) {
     log.info('Egress lockdown active', { containerName: agentContainerName(spec), network: EGRESS_NETWORK });
-    return egressNetworkArgs();
+    return [...egressNetworkArgs(), ...extraHosts];
   }
-  return os.platform() === 'linux' ? ['--add-host=host.docker.internal:host-gateway'] : [];
+  const gateway = os.platform() === 'linux' ? ['--add-host=host.docker.internal:host-gateway'] : [];
+  return [...gateway, ...extraHosts];
 }
 
 registerSessionDriver(

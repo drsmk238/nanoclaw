@@ -163,6 +163,7 @@ traffic is not confined to the internal network.
 | `NANOCLAW_EGRESS_LOCKDOWN` | `false` | Set `true` to opt in (otherwise the host-gateway path is used). |
 | `NANOCLAW_EGRESS_NETWORK` | `nanoclaw-egress` | Network name. |
 | `ONECLI_GATEWAY_CONTAINER` | `onecli` | Gateway container to attach. |
+| `NANOCLAW_EXTRA_HOSTS` | _unset_ | Comma- or whitespace-separated `name:address` pairs written into every agent container's `/etc/hosts`. See below. |
 
 These variables are read from the **host process** environment (the service's
 environment / `.env`), not from inside the container. The agent container is
@@ -174,6 +175,37 @@ internet** — all traffic must go through OneCLI. Proxy-aware clients (npm, pnp
 pip, curl, node/bun with the proxy env) are unaffected. Any workflow that relies
 on a **non-proxy-aware** tool reaching the internet directly will fail by design.
 Lockdown is **off by default**; opt in with `NANOCLAW_EGRESS_LOCKDOWN=true`.
+
+### Extra host mappings (`NANOCLAW_EXTRA_HOSTS`)
+
+Docker generates each container's `/etc/hosts` from scratch — only
+`resolv.conf` is inherited from the host — so hosts-file entries added on the
+host are **not** visible inside agent containers. `NANOCLAW_EXTRA_HOSTS` hands
+the same mappings to the runtime at spawn, as `--add-host` arguments:
+
+```
+NANOCLAW_EXTRA_HOSTS=intranet.example.org:10.0.1.204,mail.example.org:10.12.0.114
+```
+
+The case it exists for is a network whose internal services are published under
+public names that resolve, from outside, to addresses the local firewall will
+not route back inward (no NAT hairpin): the name must resolve to the internal
+address, and the container's DNS will not do it. Prefer pointing container DNS
+at the network's own resolver when there is one — that covers every internal
+name rather than an enumerated few; reach for this when there is not, or when
+only a handful of names need pinning.
+
+Entries are parsed by splitting on the **first** colon, so bare IPv6 literals
+are preserved. Addresses must be a valid IP or Docker's `host-gateway`; names
+are charset-validated. A malformed entry is logged and skipped rather than
+thrown — a typo in this list must not crash-loop the host — so check
+`logs/nanoclaw.log` for `Ignoring malformed NANOCLAW_EXTRA_HOSTS entry` if a
+mapping does not appear. The accepted set is logged per spawn as `Injecting
+extra container host mappings`.
+
+This grants **no reachability of its own** — it writes a name-to-address line
+and nothing more — so it is orthogonal to egress lockdown and applies under
+both network topologies.
 
 ## Resource Limits
 

@@ -18,6 +18,7 @@ vi.mock('../log.js', () => ({
 import {
   configuredDriverKind,
   createSessionDriver,
+  extraHostArgs,
   getSessionDriver,
   mountPolicy,
   readSetting,
@@ -216,5 +217,58 @@ describe('readSetting', () => {
   it('trims and treats blank as unset', () => {
     writeEnv('NANOCLAW_SESSION_MATERIAL_ROOT=   \n');
     expect(readSetting('NANOCLAW_SESSION_MATERIAL_ROOT', {})).toBe('');
+  });
+});
+
+describe('extraHostArgs', () => {
+  it('is empty when unset, so an install that never sets it spawns as before', () => {
+    expect(extraHostArgs({})).toEqual([]);
+  });
+
+  it('reads from .env, not just process.env — the file the service actually parses', () => {
+    writeEnv('NANOCLAW_EXTRA_HOSTS=intranet.example.org:10.0.1.204\n');
+    expect(extraHostArgs({})).toEqual(['--add-host=intranet.example.org:10.0.1.204']);
+  });
+
+  it('accepts comma- and whitespace-separated pairs', () => {
+    expect(
+      extraHostArgs({
+        NANOCLAW_EXTRA_HOSTS: 'a.example.org:10.0.0.1, b.example.org:10.0.0.2   c.example.org:10.0.0.3',
+      }),
+    ).toEqual([
+      '--add-host=a.example.org:10.0.0.1',
+      '--add-host=b.example.org:10.0.0.2',
+      '--add-host=c.example.org:10.0.0.3',
+    ]);
+  });
+
+  // The whole reason for splitting on the first colon rather than the last.
+  it('keeps a bare IPv6 literal intact', () => {
+    expect(extraHostArgs({ NANOCLAW_EXTRA_HOSTS: 'v6.example.org:2001:db8::1' })).toEqual([
+      '--add-host=v6.example.org:2001:db8::1',
+    ]);
+  });
+
+  it("accepts Docker's host-gateway magic value", () => {
+    expect(extraHostArgs({ NANOCLAW_EXTRA_HOSTS: 'gw.example.org:host-gateway' })).toEqual([
+      '--add-host=gw.example.org:host-gateway',
+    ]);
+  });
+
+  // A typo must not become a host crash loop: the bad entry is dropped, the
+  // good one still reaches the runtime.
+  it('skips malformed entries with a warning and keeps the valid ones', () => {
+    expect(
+      extraHostArgs({
+        NANOCLAW_EXTRA_HOSTS: 'no-address,bad.example.org:not-an-ip,:10.0.0.9,good.example.org:10.0.0.1',
+      }),
+    ).toEqual(['--add-host=good.example.org:10.0.0.1']);
+    expect(log.warn).toHaveBeenCalledTimes(3);
+  });
+
+  // Values reach an argv array, so a space or flag-shaped name would otherwise
+  // become a separate docker argument.
+  it('rejects a name carrying argv-shaped or out-of-charset text', () => {
+    expect(extraHostArgs({ NANOCLAW_EXTRA_HOSTS: '"--privileged x":10.0.0.1|evil.example.org:10.0.0.2' })).toEqual([]);
   });
 });
