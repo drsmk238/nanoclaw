@@ -5,6 +5,7 @@ import {
   type HistoryRow,
 } from '../../modules/cross-session-context/index.js';
 import { registerResource } from '../crud.js';
+import { formatActivityLines, sessionActivity, type ActivityRow } from '../session-activity.js';
 
 registerResource({
   name: 'session',
@@ -74,6 +75,28 @@ registerResource({
       // (the dispatcher's sessions pre-handler check covers this verb too).
       handler: async (args, ctx) => await sessionHistory(args, ctx),
       formatHuman: (data) => formatHistoryLines(data as HistoryRow[]),
+    },
+    activity: {
+      access: 'open',
+      description:
+        'What every agent is doing right now, and for how long.\n\n' +
+        'One row per session that is working (a turn in flight) or has messages queued: the agent, ' +
+        'how long it has been at it, who asked (`agent:<name>`, `task:<series>`, or the channel), the ' +
+        'request itself (capped at 160 chars), the tool in flight and for how long, and anything queued ' +
+        'behind it. A working agent with no heartbeat for 5 minutes is flagged "quiet". `--all` adds ' +
+        'running containers that are idle. `--json` returns the raw rows with ISO `since` timestamps. ' +
+        'Agents below global cli_scope see only their own group.',
+      examples: ['ncl sessions activity', 'ncl sessions activity --all --json'],
+      args: [
+        {
+          name: 'all',
+          type: 'boolean',
+          description: 'Also list running containers with nothing to do.',
+          default: false,
+        },
+      ],
+      handler: async (args, ctx) => await sessionActivity(args, ctx),
+      formatHuman: (data) => formatActivityLines(data as ActivityRow[]),
     },
   },
 });

@@ -53,6 +53,7 @@ import {
 import type {
   AgentMailbox,
   InboundMailbox,
+  MailboxActivityMessage,
   MailboxHistoryMessage,
   MailboxSession,
   MailboxSessionKey,
@@ -152,6 +153,17 @@ function getTask(db: Database.Database, id: string): TaskRecord | undefined {
     )
     .get(id, id) as TaskSqlRow | undefined;
   return row && taskRecord(row);
+}
+
+interface ActivitySqlRow {
+  id: string;
+  kind: string;
+  timestamp: string;
+  process_after: string | null;
+  channel_type: string | null;
+  platform_id: string | null;
+  series_id: string | null;
+  content: string;
 }
 
 function getTaskStats(db: Database.Database, seriesId: string): TaskStats {
@@ -274,6 +286,39 @@ export function wrapSqliteInbound(db: Database.Database, nextSequence = () => ne
           .prepare('SELECT timestamp, kind, content FROM messages_in ORDER BY seq DESC LIMIT ?')
           .all(limit) as MailboxHistoryMessage[]
       ).map((row) => ({ ...row, timestamp: sqliteTimestamp(row.timestamp) })),
+    getInboundActivity: (claimedIds) => {
+      const select =
+        'SELECT id, kind, timestamp, process_after, channel_type, platform_id, series_id, content FROM messages_in';
+      const toActivity = (row: ActivitySqlRow): MailboxActivityMessage => ({
+        id: row.id,
+        kind: row.kind,
+        timestamp: sqliteTimestamp(row.timestamp),
+        processAfter: row.process_after === null ? null : sqliteTimestamp(row.process_after),
+        channelType: row.channel_type,
+        platformId: row.platform_id,
+        seriesId: row.series_id,
+        content: row.content,
+      });
+      const claimed =
+        claimedIds.length === 0
+          ? []
+          : (db
+              .prepare(`${select} WHERE id IN (${claimedIds.map(() => '?').join(', ')}) ORDER BY seq`)
+              .all(...claimedIds) as ActivitySqlRow[]);
+      // Same predicate as countDueMessages; claimed rows can still read
+      // 'pending' here until the host syncs their acks.
+      const claimedSet = new Set(claimedIds);
+      const queued = (
+        db
+          .prepare(
+            `${select} WHERE status = 'pending' AND trigger = 1
+               AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+             ORDER BY seq`,
+          )
+          .all() as ActivitySqlRow[]
+      ).filter((row) => !claimedSet.has(row.id));
+      return { claimed: claimed.map(toActivity), queued: queued.map(toActivity) };
+    },
     getConversationRoot: () => {
       const row = db
         .prepare(

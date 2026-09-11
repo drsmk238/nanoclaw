@@ -89,6 +89,24 @@ export interface MailboxTimelineMessage {
   content: string;
 }
 
+export interface MailboxActivityMessage {
+  id: string;
+  kind: string;
+  timestamp: string;
+  processAfter: string | null;
+  channelType: string | null;
+  platformId: string | null;
+  seriesId: string | null;
+  content: string;
+}
+
+export interface InboundActivity {
+  /** The rows behind the given processing claims (what the agent is working on). */
+  claimed: MailboxActivityMessage[];
+  /** Due trigger rows not yet claimed (what the agent will pick up next). */
+  queued: MailboxActivityMessage[];
+}
+
 /** Host-visible inbound mailbox behavior. Storage layout and lifecycle are implementation-private. */
 export interface InboundMailbox {
   setRouting(routing: SessionRouting): void;
@@ -128,6 +146,8 @@ export interface InboundMailbox {
   countLiveTasks(): number;
   prunePendingMessages(channelType: string, before: string, keep: number): number;
   getInboundHistory(limit: number): MailboxHistoryMessage[];
+  /** Read-only snapshot for `ncl sessions activity`. */
+  getInboundActivity(claimedIds: readonly string[]): InboundActivity;
   getConversationRoot(): MailboxTimelineMessage | undefined;
   findTaskBySeriesSlug(slug: string): TaskRecord | undefined;
 }
