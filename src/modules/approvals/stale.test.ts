@@ -102,6 +102,12 @@ describe('sweepStaleApprovals', () => {
     expect(await sweepStaleApprovals()).toBe(0);
     expect(await getPendingApproval('appr-onecli')).toBeDefined();
   });
+
+  it('leaves gateway credential approvals to the gateway coordinator', async () => {
+    await seed('appr-gateway', { ageMs: APPROVAL_TTL_MS + DAY, action: 'gateway_request', sessionId: null });
+    expect(await sweepStaleApprovals()).toBe(0);
+    expect(await getPendingApproval('appr-gateway')).toBeDefined();
+  });
 });
 
 describe('rejectPendingApproval', () => {

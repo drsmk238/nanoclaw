@@ -1,4 +1,5 @@
 import { rejectPendingApproval } from '../../modules/approvals/index.js';
+import { PENDING_APPROVAL_STATUSES } from '../../types.js';
 import { registerResource } from '../crud.js';
 
 registerResource({
@@ -6,7 +7,7 @@ registerResource({
   plural: 'approvals',
   table: 'pending_approvals',
   description:
-    'Pending approval — in-flight approval cards waiting for an admin response. Created by requestApproval() (self-mod install_packages/add_mcp_server) and OneCLI credential approval flow. Rows are deleted after the admin approves/rejects, after `ncl approvals reject`, or when the request expires (OneCLI gateway TTL; module-initiated cards after 7 days unanswered).',
+    'Pending approval — in-flight approval cards waiting for an admin response. Created by registered modules or the selected gateway. Rows are deleted after the admin approves/rejects, after `ncl approvals reject`, or when the request expires (gateway TTL; module-initiated cards after 7 days unanswered).',
   idColumn: 'approval_id',
   columns: [
     {
@@ -17,18 +18,17 @@ registerResource({
     {
       name: 'session_id',
       type: 'string',
-      description: 'Session that requested the approval. Null for OneCLI credential approvals.',
+      description: 'Session that requested the approval. May be null for gateway-owned approvals.',
     },
     {
       name: 'request_id',
       type: 'string',
-      description: 'Original request identifier (OneCLI request UUID or same as approval_id).',
+      description: 'Original provider request identifier or the same value as approval_id.',
     },
     {
       name: 'action',
       type: 'string',
-      description:
-        'Action type — matches the registered approval handler (e.g. install_packages, add_mcp_server, onecli_credential).',
+      description: 'Action type — matches a registered module or gateway response handler.',
     },
     { name: 'payload', type: 'json', description: 'JSON payload carried through to the approval handler.' },
     { name: 'created_at', type: 'string', description: 'Auto-set.' },
@@ -40,12 +40,13 @@ registerResource({
       type: 'string',
       description: 'Platform message ID of the delivered card (for editing on expiry).',
     },
-    { name: 'expires_at', type: 'string', description: 'When this approval expires (OneCLI gateway TTL).' },
+    { name: 'expires_at', type: 'string', description: 'When this approval expires, if provider-gated.' },
     {
       name: 'status',
       type: 'string',
-      description: 'Current status.',
-      enum: ['pending', 'approved', 'rejected', 'expired'],
+      description:
+        'Current status. awaiting_reason means the admin chose "Reject with reason…" and the reply is still pending.',
+      enum: [...PENDING_APPROVAL_STATUSES],
     },
     { name: 'title', type: 'string', description: 'Card title shown to the admin.' },
     { name: 'options_json', type: 'json', description: 'Card button options as JSON array.' },

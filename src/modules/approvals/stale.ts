@@ -11,13 +11,14 @@
  *   2. `rejectPendingApproval` — an explicit reject by id, backing
  *      `ncl approvals reject`, for clearing a card without its buttons.
  *
- * OneCLI credential approvals keep their own expiry (onecli-approvals.ts);
- * rejecting one by id resolves its in-memory decision the same way a click does.
+ * Gateway credential approvals keep their own expiry (gateway-approval-coordinator.ts,
+ * which also retires legacy `onecli_credential` rows at start); rejecting one by
+ * id goes through the coordinator exactly as a Reject click does.
  */
 import { deletePendingApproval, getPendingApproval, getSession, getStalePendingApprovals } from '../../db/sessions.js';
+import { GATEWAY_APPROVAL_ACTION, rejectGatewayApproval } from '../../gateway-approval-coordinator.js';
 import { log } from '../../log.js';
 import { finalizeExpired, finalizeReject } from './finalize.js';
-import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
 import { clampReason } from './reason-capture.js';
 
 export const APPROVAL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -25,7 +26,9 @@ export const APPROVAL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** Host-sweep hook: expire module-initiated approvals unanswered for APPROVAL_TTL_MS. */
 export async function sweepStaleApprovals(now: number = Date.now()): Promise<number> {
   const cutoff = new Date(now - APPROVAL_TTL_MS).toISOString();
-  const rows = await getStalePendingApprovals(cutoff, ONECLI_ACTION);
+  const rows = (await getStalePendingApprovals(cutoff, GATEWAY_APPROVAL_ACTION)).filter(
+    (row) => row.action !== 'onecli_credential',
+  );
   let expired = 0;
   for (const approval of rows) {
     const session = approval.session_id ? await getSession(approval.session_id) : undefined;
@@ -55,8 +58,8 @@ export async function rejectPendingApproval(
   const approval = await getPendingApproval(approvalId);
   if (!approval) throw new Error(`No pending approval with id ${approvalId}.`);
 
-  if (approval.action === ONECLI_ACTION) {
-    if (await resolveOneCLIApproval(approvalId, 'reject')) return 'rejected';
+  if (approval.action === GATEWAY_APPROVAL_ACTION || approval.action === 'onecli_credential') {
+    if (await rejectGatewayApproval(approvalId)) return 'rejected';
     await deletePendingApproval(approvalId);
     return 'removed';
   }
