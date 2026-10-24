@@ -4,6 +4,8 @@
  * card answers, retries, confirmations, message kinds, TLS). No network.
  */
 import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
@@ -95,6 +97,12 @@ const mail = (o: {
       o.body,
   );
 
+// The adapter keeps its state under <cwd>/store/proton-mail. Point cwd at a
+// scratch directory so a test run never touches a real install's state.
+const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'proton-mail-test-'));
+const STORE = path.join(SCRATCH, 'store', 'proton-mail');
+const STATE = path.join(STORE, 'state.json');
+
 const tick = () => new Promise((r) => setTimeout(r, 100));
 
 async function start(onInbound?: (msg: any) => Promise<void>) {
@@ -143,6 +151,8 @@ const card = (questionId: string, title: string) => ({
 const tokenOf = (subject: string) => /NC-[A-Z2-7]{13}/.exec(subject)![0];
 
 beforeEach(() => {
+  vi.spyOn(process, 'cwd').mockReturnValue(SCRATCH);
+  if (process.cwd() !== SCRATCH) throw new Error('refusing to run: cwd is not the scratch directory');
   vi.resetModules();
   h.env = { PROTON_MAIL_ADDRESS: 'assistant@pm.me', PROTON_MAIL_BRIDGE_PASSWORD: 'x'.repeat(22) };
   h.mailbox = [];
@@ -151,7 +161,7 @@ beforeEach(() => {
   h.flags = [];
   h.render = undefined;
   h.nextId = 0;
-  fs.rmSync('store/proton-mail', { recursive: true, force: true });
+  fs.rmSync(STORE, { recursive: true, force: true });
 });
 
 describe('sender identity', () => {
@@ -261,11 +271,11 @@ describe('retries', () => {
     });
     const uid = await arrive(mail({ subject: 'Hello', body: 'first' }));
     expect(h.flags).toEqual([]);
-    const state = JSON.parse(fs.readFileSync('store/proton-mail/state.json', 'utf8'));
+    const state = JSON.parse(fs.readFileSync(STATE, 'utf8'));
     expect(state.retry[uid].attempts).toBe(1);
     // Make it due now and poll again.
     state.retry[uid].nextAt = new Date(0).toISOString();
-    fs.writeFileSync('store/proton-mail/state.json', JSON.stringify(state));
+    fs.writeFileSync(STATE, JSON.stringify(state));
     vi.resetModules();
     h.imaps = [];
     fail = false;
@@ -283,9 +293,9 @@ describe('retries', () => {
     });
     const bad = await arrive(mail({ body: 'poison' }));
     for (let i = 0; i < 4; i++) {
-      const state = JSON.parse(fs.readFileSync('store/proton-mail/state.json', 'utf8'));
+      const state = JSON.parse(fs.readFileSync(STATE, 'utf8'));
       state.retry[bad].nextAt = new Date(0).toISOString();
-      fs.writeFileSync('store/proton-mail/state.json', JSON.stringify(state));
+      fs.writeFileSync(STATE, JSON.stringify(state));
       vi.resetModules();
       const r = await start(async (m) => {
         if (m.content.text.startsWith('poison')) throw new Error('always');
@@ -293,7 +303,7 @@ describe('retries', () => {
       h.mailbox = h.mailbox.slice(0, 1);
       await r.poll();
     }
-    const state = JSON.parse(fs.readFileSync('store/proton-mail/state.json', 'utf8'));
+    const state = JSON.parse(fs.readFileSync(STATE, 'utf8'));
     expect(state.retry[bad]).toBeUndefined();
     expect(h.flags).toEqual([[bad, ['$NanoClawFailed']]]);
     vi.resetModules();
@@ -350,15 +360,15 @@ describe('transport security', () => {
   });
 
   it('pins the bridge certificate when one is configured', async () => {
-    fs.mkdirSync('store/proton-mail', { recursive: true });
-    fs.writeFileSync('store/proton-mail/bridge-cert.pem', 'PEM');
-    h.env.PROTON_MAIL_TLS_CA_FILE = 'store/proton-mail/bridge-cert.pem';
+    fs.mkdirSync(STORE, { recursive: true });
+    fs.writeFileSync(path.join(STORE, 'bridge-cert.pem'), 'PEM');
+    h.env.PROTON_MAIL_TLS_CA_FILE = path.join(STORE, 'bridge-cert.pem');
     const { imap } = await start();
     expect(imap.opts.tls).toEqual({ ca: Buffer.from('PEM'), rejectUnauthorized: true });
   });
 
   it('does not start when the pinned certificate is missing', async () => {
-    h.env.PROTON_MAIL_TLS_CA_FILE = 'store/proton-mail/missing.pem';
+    h.env.PROTON_MAIL_TLS_CA_FILE = path.join(STORE, 'missing.pem');
     await import('./proton-mail.js');
     expect(h.reg.factory()).toBeNull();
   });
