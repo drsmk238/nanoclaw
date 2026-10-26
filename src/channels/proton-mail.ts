@@ -15,8 +15,9 @@
  * unknown-sender policy (request_approval) instead of being silently dropped.
  *
  * Who a mail is from: the From header is the sender's own claim, so a mail
- * counts as from its address only when Proton's own DMARC verdict passes for
- * that address's domain (checkSenderAuth). DMARC vouches for a domain, not a
+ * counts as from its address only when Proton vouches for it (checkSenderAuth):
+ * Proton's own DMARC verdict passes for that address's domain, or Proton marks
+ * the mail as sent from a Proton account. DMARC vouches for a domain, not a
  * mailbox, so approval cards carry a per-card token as well: an answer counts
  * only when it quotes the token and replies to the card mail itself.
  *
@@ -75,7 +76,12 @@ const RETRY_BASE_MS = 60_000;
 const RETRY_MAX_MS = 60 * 60_000;
 /** IMAP keyword left on a mail the adapter gave up on, so a human can find it. */
 const FAILED_KEYWORD = '$NanoClawFailed';
-/** Stamped on every outbound mail; an inbound carrying it is our own echo. */
+/**
+ * Stamped on every outbound mail; an inbound carrying it is our own echo.
+ * Bridge builds each outgoing mail from a fixed draft template and drops
+ * other headers, so through Bridge this never arrives; mail from the bridge
+ * account's own address is dropped separately (handleMessage).
+ */
 const LOOP_HEADER = 'x-nanoclaw-agent';
 
 /**
@@ -215,11 +221,24 @@ export const PROTON_AUTHSERV_ID = 'mail.protonmail.ch';
  *
  * Exactly one DMARC verdict from Proton is required. A forger can write their
  * own `mail.protonmail.ch; dmarc=pass` header, but cannot remove the real one
- * Proton adds, so a forgery shows up as two verdicts and fails.
+ * Proton adds, so a forgery shows up as two verdicts and fails. (Probed on
+ * Bridge 3.27.0: Proton also strips such a header from external mail.)
  *
- * `authResults` is the value of every Authentication-Results header line.
+ * Mail from another Proton account carries no Authentication-Results at all.
+ * Proton marks it `X-Pm-Origin: internal`, and its From comes from Proton's
+ * record of the sending account, which can only send as addresses it owns.
+ * It counts as verified only with exactly one X-Pm-Origin, `internal`, and no
+ * DMARC verdict from Proton. Probed on Bridge 3.27.0: Proton strips a
+ * sender-supplied X-Pm-Origin from external mail and adds its own `external`,
+ * and Bridge cannot add headers to mail sent from a Proton account. Should a
+ * forged `internal` ever survive, it sits beside Proton's `external` and the
+ * DMARC verdict, and fails; should Proton stop sending the header, internal
+ * mail goes back to failing.
+ *
+ * `authResults` is the value of every Authentication-Results header line;
+ * `pmOrigin` of every X-Pm-Origin line.
  */
-export function checkSenderAuth(fromAddress: string, authResults: string[]): string | null {
+export function checkSenderAuth(fromAddress: string, authResults: string[], pmOrigin: string[] = []): string | null {
   const fromDomain = normalizeAddress(fromAddress).split('@').pop() ?? '';
   const verdicts: Array<{ result: string; domain?: string }> = [];
   for (const raw of authResults) {
@@ -235,6 +254,11 @@ export function checkSenderAuth(fromAddress: string, authResults: string[]): str
       const domain = /\bheader\.from\s*=\s*([^\s;]+)/i.exec(info)?.[1];
       verdicts.push({ result: m[1].toLowerCase(), domain: domain?.toLowerCase() });
     }
+  }
+  const origins = pmOrigin.map((o) => o.trim().toLowerCase());
+  if (origins.length > 1) return `${origins.length} X-Pm-Origin headers`;
+  if (origins[0] === 'internal') {
+    return verdicts.length === 0 ? null : 'internal mail carrying a DMARC verdict';
   }
   if (verdicts.length === 0) return 'no DMARC verdict from Proton';
   if (verdicts.length > 1) return `${verdicts.length} DMARC verdicts claiming to be Proton's`;
@@ -723,11 +747,6 @@ registerChannelAdapter('proton-mail', {
       subject?: string;
       /** Thread onto this mail instead of the conversation's last one. */
       inReplyTo?: string;
-      /**
-       * RFC 3834 Auto-Submitted: 'auto-replied' for the adapter's own notices
-       * answering a mail; everything else an agent sends is 'auto-generated'.
-       */
-      autoSubmitted?: 'auto-replied' | 'auto-generated';
     }
 
     async function sendMail(
@@ -747,7 +766,9 @@ registerChannelAdapter('proton-mail', {
         subject: opts.subject ?? (thread ? replySubject(thread.subject) : cfg.defaultSubject),
         text,
         attachments: files,
-        headers: { 'X-NanoClaw-Agent': 'proton-mail', 'Auto-Submitted': opts.autoSubmitted ?? 'auto-generated' },
+        // Bridge rebuilds every outgoing mail from a draft template and drops
+        // headers like these (and Auto-Submitted); kept for a non-Bridge server.
+        headers: { 'X-NanoClaw-Agent': 'proton-mail' },
         ...(inReplyTo && { inReplyTo, references: [...new Set(references)].join(' ') || inReplyTo }),
       });
       const sentId: string | undefined = info?.messageId;
@@ -780,7 +801,7 @@ registerChannelAdapter('proton-mail', {
 
     /** The adapter's own notice answering an inbound mail, on that mail's thread. */
     function sendNotice(to: string, text: string, subject: string, inReplyTo: string): Promise<string | undefined> {
-      return sendMail(to, text, [], { thread: 'own', subject, inReplyTo, autoSubmitted: 'auto-replied' });
+      return sendMail(to, text, [], { thread: 'own', subject, inReplyTo });
     }
 
     /** 'done': handled (or deliberately dropped); 'leave-unread': refused, for a human to look at. */
@@ -794,6 +815,14 @@ registerChannelAdapter('proton-mail', {
         return 'leave-unread';
       }
       const fromAddr = sender.address;
+
+      // The bridge account's own mail is Proton-internal and so verified, but
+      // it is never a correspondent: an agent mailing its own address must not
+      // hear itself. Bridge drops LOOP_HEADER, so this check carries the load.
+      if (fromAddr === cfg.address) {
+        log.debug('Proton Mail inbound skipped', { uid, reason: 'own address' });
+        return 'leave-unread';
+      }
 
       const skip = shouldSkipInbound({
         fromAddress: fromAddr,
@@ -813,7 +842,11 @@ registerChannelAdapter('proton-mail', {
       // Before anything acts on the sender — a card answer, a thread, the
       // router — the sender must be who the From line says. An unverified
       // mail stays unread in the mailbox for a human to look at.
-      const authFailure = checkSenderAuth(fromAddr, rawHeaderValues(parsed, 'authentication-results'));
+      const authFailure = checkSenderAuth(
+        fromAddr,
+        rawHeaderValues(parsed, 'authentication-results'),
+        rawHeaderValues(parsed, 'x-pm-origin'),
+      );
       if (authFailure) {
         log.warn('Proton Mail: refused mail whose sender is unverified', { uid, from: fromAddr, reason: authFailure });
         return 'leave-unread';

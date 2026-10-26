@@ -224,6 +224,31 @@ describe('checkSenderAuth', () => {
       /not example\.org/,
     );
   });
+
+  describe('mail from another Proton account (X-Pm-Origin)', () => {
+    it('accepts one X-Pm-Origin: internal with no DMARC verdict', () => {
+      expect(checkSenderAuth('friend@proton.me', [], [' internal'])).toBeNull();
+      // Proton-hosted custom domains are internal too.
+      expect(checkSenderAuth('friend@example.org', [], ['Internal'])).toBeNull();
+    });
+    it('still refuses mail without a verdict when it is not internal', () => {
+      expect(checkSenderAuth('friend@proton.me', [], [' external'])).toBe('no DMARC verdict from Proton');
+      expect(checkSenderAuth('friend@proton.me', [])).toBe('no DMARC verdict from Proton');
+    });
+    it('refuses a forged internal beside Proton’s own external', () => {
+      expect(checkSenderAuth('owner@example.org', genuine, [' internal', ' external'])).toBe('2 X-Pm-Origin headers');
+      expect(checkSenderAuth('owner@example.org', genuine, [' external', ' internal'])).toBe('2 X-Pm-Origin headers');
+    });
+    it('refuses internal mail that also carries a Proton DMARC verdict', () => {
+      expect(checkSenderAuth('owner@example.org', genuine, [' internal'])).toBe(
+        'internal mail carrying a DMARC verdict',
+      );
+    });
+    it('external mail keeps the DMARC rule', () => {
+      expect(checkSenderAuth('owner@example.org', genuine, [' external'])).toBeNull();
+      expect(checkSenderAuth('owner@example.org', [forgedFail], [' external'])).toBe('dmarc=fail');
+    });
+  });
 });
 
 describe('singleSender', () => {

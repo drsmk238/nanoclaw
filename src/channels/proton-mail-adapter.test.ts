@@ -345,17 +345,26 @@ describe('approval card lifecycle', () => {
     await arrive(approveReply(id));
     expect(calls.action.map((a) => a[0])).toEqual(['appr-OLD']);
   });
+});
 
-  it('notices carry Auto-Submitted: auto-replied, agent mail auto-generated', async () => {
-    const { adapter, arrive } = await start();
-    const id = await adapter.deliver(OWNER, null, card('appr-H', 'Install jq?'));
-    await arrive(approveReply(id));
-    await adapter.deliver(OWNER, null, { kind: 'chat', content: { text: 'Done' } });
-    expect(h.sent.map((m) => m.headers['Auto-Submitted'])).toEqual([
-      'auto-generated',
-      'auto-replied',
-      'auto-generated',
-    ]);
+describe('mail from another Proton account', () => {
+  it('is delivered on Proton’s X-Pm-Origin: internal, with no DMARC verdict', async () => {
+    const { calls, arrive } = await start();
+    await arrive(mail({ from: 'friend@proton.me', body: 'hello from Proton', auth: 'X-Pm-Origin: internal' }));
+    expect(calls.inbound.map((m) => m.content.sender)).toEqual(['friend@proton.me']);
+  });
+
+  it('refuses a forged internal beside Proton’s own external', async () => {
+    const { calls, arrive } = await start();
+    const uid = await arrive(mail({ body: 'trust me', extra: ['X-Pm-Origin: internal', 'X-Pm-Origin: external'] }));
+    expect(calls.inbound).toHaveLength(0);
+    expect(h.flags.filter(([u]) => u === uid)).toEqual([]);
+  });
+
+  it('never delivers mail from the bridge account’s own address', async () => {
+    const { calls, arrive } = await start();
+    await arrive(mail({ from: 'assistant@pm.me', body: 'echo', auth: 'X-Pm-Origin: internal' }));
+    expect(calls.inbound).toHaveLength(0);
   });
 });
 
