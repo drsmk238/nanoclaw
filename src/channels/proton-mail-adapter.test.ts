@@ -42,7 +42,7 @@ vi.mock('nodemailer', () => ({
       sendMail: async (m: any) => {
         if (h.sendFail) throw new Error('SMTP down');
         h.sent.push(m);
-        return { messageId: `<out-${++h.nextId}@pm.me>` };
+        return { messageId: `<out-${++h.nextId}@bridge.example>` };
       },
       close() {},
     }),
@@ -94,7 +94,7 @@ const mail = (o: {
     [
       o.auth ?? PASS,
       `From: ${o.from ?? OWNER}`,
-      'To: assistant@pm.me',
+      'To: assistant@bridge.example',
       o.subject !== undefined ? `Subject: ${o.subject}` : '',
       `Message-ID: <m${Math.random().toString(36).slice(2)}@example.org>`,
       'Date: Thu, 01 Jan 2099 00:00:00 +0000',
@@ -176,7 +176,7 @@ beforeEach(() => {
   vi.spyOn(process, 'cwd').mockReturnValue(SCRATCH);
   if (process.cwd() !== SCRATCH) throw new Error('refusing to run: cwd is not the scratch directory');
   vi.resetModules();
-  h.env = { PROTON_MAIL_ADDRESS: 'assistant@pm.me', PROTON_MAIL_BRIDGE_PASSWORD: 'x'.repeat(22) };
+  h.env = { PROTON_MAIL_ADDRESS: 'assistant@bridge.example', PROTON_MAIL_BRIDGE_PASSWORD: 'x'.repeat(22) };
   h.mailbox = [];
   h.imaps = [];
   h.sent = [];
@@ -352,8 +352,8 @@ describe('approval card lifecycle', () => {
 describe('mail from another Proton account', () => {
   it('is delivered on Proton’s X-Pm-Origin: internal, with no DMARC verdict', async () => {
     const { calls, arrive } = await start();
-    await arrive(mail({ from: 'friend@proton.me', body: 'hello from Proton', auth: 'X-Pm-Origin: internal' }));
-    expect(calls.inbound.map((m) => m.content.sender)).toEqual(['friend@proton.me']);
+    await arrive(mail({ from: 'friend@proton.example', body: 'hello from Proton', auth: 'X-Pm-Origin: internal' }));
+    expect(calls.inbound.map((m) => m.content.sender)).toEqual(['friend@proton.example']);
   });
 
   it('refuses a forged internal beside Proton’s own external', async () => {
@@ -365,7 +365,7 @@ describe('mail from another Proton account', () => {
 
   it('never delivers mail from the bridge account’s own address', async () => {
     const { calls, arrive } = await start();
-    await arrive(mail({ from: 'assistant@pm.me', body: 'echo', auth: 'X-Pm-Origin: internal' }));
+    await arrive(mail({ from: 'assistant@bridge.example', body: 'echo', auth: 'X-Pm-Origin: internal' }));
     expect(calls.inbound).toHaveLength(0);
   });
 });
@@ -424,7 +424,7 @@ describe('review of #4218 (ultrareview)', () => {
       cards[`NC-${String(i).padStart(13, 'A')}`] = {
         questionId: `q${i}`,
         address: OWNER,
-        messageId: `<c${i}@pm.me>`,
+        messageId: `<c${i}@bridge.example>`,
         subject: 's',
         title: 't',
         options: [],
@@ -482,7 +482,7 @@ describe('sender and size limits', () => {
       [
         PASS,
         `From: ${from}`,
-        'To: assistant@pm.me',
+        'To: assistant@bridge.example',
         'Subject: Report',
         'Message-ID: <att1@example.org>',
         'Content-Type: multipart/mixed; boundary="b1"',

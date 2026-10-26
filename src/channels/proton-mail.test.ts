@@ -66,7 +66,7 @@ describe('stripQuotedReply', () => {
     const text =
       'Hello testing your reply. \n\n\nS\n\n\n\n' +
       '-'.repeat(80) +
-      '\n\nFrom: agent@proton.me <agent@proton.me>\nSent: Sunday, 06 September 2026 06:29\nTo: Owner\nSubject: Message\n\nHi there';
+      '\n\nFrom: agent@proton.example <agent@proton.example>\nSent: Sunday, 06 September 2026 06:29\nTo: Owner\nSubject: Message\n\nHi there';
     expect(stripQuotedReply(text)).toBe('Hello testing your reply. \n\n\nS'.trimEnd());
   });
   it('cuts at a bare From:/Sent: header block', () => {
@@ -111,7 +111,7 @@ describe('shouldSkipInbound', () => {
     expect(shouldSkipInbound({ fromAddress: 'friend@example.com', autoSubmitted: 'no' })).toBeNull();
   });
   it('drops our own echo', () => {
-    expect(shouldSkipInbound({ fromAddress: 'me@proton.me', loopHeader: 'proton-mail' })).toBe('own echo');
+    expect(shouldSkipInbound({ fromAddress: 'me@proton.example', loopHeader: 'proton-mail' })).toBe('own echo');
   });
   it('drops bounces and auto-replies', () => {
     expect(shouldSkipInbound({ fromAddress: 'MAILER-DAEMON@mx.proton.me' })).toBe('system sender');
@@ -234,13 +234,13 @@ describe('checkSenderAuth', () => {
 
   describe('mail from another Proton account (X-Pm-Origin)', () => {
     it('accepts one X-Pm-Origin: internal with no DMARC verdict', () => {
-      expect(checkSenderAuth('friend@proton.me', [], [' internal'])).toBeNull();
+      expect(checkSenderAuth('friend@proton.example', [], [' internal'])).toBeNull();
       // Proton-hosted custom domains are internal too.
       expect(checkSenderAuth('friend@example.org', [], ['Internal'])).toBeNull();
     });
     it('still refuses mail without a verdict when it is not internal', () => {
-      expect(checkSenderAuth('friend@proton.me', [], [' external'])).toBe('no DMARC verdict from Proton');
-      expect(checkSenderAuth('friend@proton.me', [])).toBe('no DMARC verdict from Proton');
+      expect(checkSenderAuth('friend@proton.example', [], [' external'])).toBe('no DMARC verdict from Proton');
+      expect(checkSenderAuth('friend@proton.example', [])).toBe('no DMARC verdict from Proton');
     });
     it('refuses a forged internal beside Proton’s own external', () => {
       expect(checkSenderAuth('owner@example.org', genuine, [' internal', ' external'])).toBe('2 X-Pm-Origin headers');
@@ -326,7 +326,7 @@ describe('matchCardReply', () => {
   const card = (token: string, over: Partial<CardRef> = {}): CardRef => ({
     questionId: `q-${token}`,
     address: 'owner@example.org',
-    messageId: `<${token}@pm.me>`,
+    messageId: `<${token}@bridge.example>`,
     subject: `[${token}] Install jq?`,
     title: 'Install jq?',
     options,
@@ -342,7 +342,7 @@ describe('matchCardReply', () => {
       fromAddress: over.from ?? 'owner@example.org',
       subject: over.subject ?? `Re: [${A}] Install jq?`,
       body: over.body ?? '/approve',
-      inReplyTo: over.inReplyTo ?? `<${A}@pm.me>`,
+      inReplyTo: over.inReplyTo ?? `<${A}@bridge.example>`,
     });
 
   it('answers the card the reply names — never a newer one', () => {
@@ -368,7 +368,7 @@ describe('matchCardReply', () => {
       fromAddress: 'owner@example.org',
       subject: `Re: [${A}] x`,
       body: '/approve',
-      inReplyTo: `<${A}@pm.me>`,
+      inReplyTo: `<${A}@bridge.example>`,
     });
     expect(m).toMatchObject({ kind: 'refused', reason: /already answered/ });
   });
