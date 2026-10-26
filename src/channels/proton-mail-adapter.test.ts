@@ -6,7 +6,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
   reg: undefined as any,
@@ -17,6 +17,11 @@ const h = vi.hoisted(() => ({
   flags: [] as Array<[number, string[]]>,
   render: undefined as any,
   nextId: 0,
+  /** UIDs whose fetch throws. */
+  fetchFail: new Set<number>(),
+  sendFail: false,
+  /** Whether the sender's DM is wired to an agent (approved). */
+  wired: true,
 }));
 
 vi.mock('./channel-registry.js', () => ({
@@ -26,11 +31,16 @@ vi.mock('./channel-registry.js', () => ({
 }));
 vi.mock('../env.js', () => ({ readEnvFile: () => h.env }));
 vi.mock('./question-render-registry.js', () => ({ resolveQuestionRender: async () => h.render }));
+vi.mock('../db/messaging-groups.js', () => ({
+  getMessagingGroupByPlatform: async () => (h.wired ? { id: 'mg-1', denied_at: null } : undefined),
+  getMessagingGroupAgents: async () => (h.wired ? [{ id: 'mga-1' }] : []),
+}));
 vi.mock('nodemailer', () => ({
   default: {
     createTransport: (opts: any) => ({
       opts,
       sendMail: async (m: any) => {
+        if (h.sendFail) throw new Error('SMTP down');
         h.sent.push(m);
         return { messageId: `<out-${++h.nextId}@pm.me>` };
       },
@@ -58,6 +68,7 @@ vi.mock('imapflow', () => ({
       }
     }
     async fetchOne(uid: string) {
+      if (h.fetchFail.has(Number(uid))) throw new Error('FETCH failed');
       const m = h.mailbox.find((x) => x.uid === Number(uid));
       return m && { uid: m.uid, source: m.source, internalDate: new Date('2026-10-24T09:00:00Z') };
     }
@@ -105,21 +116,30 @@ const STATE = path.join(STORE, 'state.json');
 
 const tick = () => new Promise((r) => setTimeout(r, 100));
 
-async function start(onInbound?: (msg: any) => Promise<void>) {
+/** The first poll, one interval after setup(): only then does the adapter read mail. */
+async function firstPoll() {
+  vi.advanceTimersByTime(60_000);
+  await tick();
+}
+
+async function start(opts: { firstPoll?: boolean } = {}) {
   await import('./proton-mail.js');
   const adapter = h.reg.factory();
-  const calls = { inbound: [] as any[], action: [] as any[][] };
+  const calls = { inbound: [] as any[], action: [] as any[][], metadata: [] as any[][] };
   await adapter.setup({
-    onInbound: async (_pid: string, _t: null, msg: any) => {
-      if (onInbound) await onInbound(msg);
+    // Like the host: routing is queued, and onInbound never throws.
+    onInbound: (_pid: string, _t: null, msg: any) => {
       calls.inbound.push(msg);
     },
     onInboundEvent() {},
-    onMetadata() {},
+    onMetadata: (...a: any[]) => {
+      calls.metadata.push(a);
+    },
     onAction: (...a: any[]) => {
       calls.action.push(a);
     },
   });
+  if (opts.firstPoll !== false) await firstPoll();
   const imap = h.imaps[h.imaps.length - 1];
   let uid = 0;
   const arrive = async (source: Buffer) => {
@@ -159,9 +179,19 @@ beforeEach(() => {
   h.imaps = [];
   h.sent = [];
   h.flags = [];
-  h.render = undefined;
+  // A live card: core still has its row.
+  h.render = { title: 'card', options: [] };
   h.nextId = 0;
+  h.fetchFail = new Set();
+  h.sendFail = false;
+  h.wired = true;
+  // Only the poll interval is faked; the tick() waits stay real.
+  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
   fs.rmSync(STORE, { recursive: true, force: true });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe('sender identity', () => {
@@ -263,12 +293,160 @@ describe('approval cards', () => {
   });
 });
 
-describe('retries', () => {
-  it('a mail whose handling failed is retried, and only marked read once handled', async () => {
-    let fail = true;
-    const { calls, arrive } = await start(async () => {
-      if (fail) throw new Error('DB busy');
+describe('approval card lifecycle', () => {
+  const approveReply = (id: string) => {
+    const token = tokenOf(h.sent.find((m) => !m.inReplyTo)!.subject);
+    return mail({ subject: `Re: [${token}] x`, body: '/approve', inReplyTo: id });
+  };
+
+  it('a terminal edit (a timed-out gateway approval) closes the card; a later reply is refused', async () => {
+    h.render = { title: 'card', options: [], deferResolution: true };
+    const { adapter, calls, arrive } = await start();
+    const id = await adapter.deliver(OWNER, null, card('appr-T', 'Use the live key?'));
+    await adapter.deliver(OWNER, null, {
+      kind: 'chat-sdk',
+      content: {
+        operation: 'edit',
+        messageId: id,
+        text: 'Use the live key?\n\n⏱️ Timed out — no response',
+        terminalCard: { resolution: '⏱️ Timed out — no response' },
+      },
     });
+    await arrive(approveReply(id));
+    expect(calls.action).toHaveLength(0);
+    expect(h.sent.at(-1).text).toMatch(/not taken as an answer: that request is no longer waiting/);
+    expect(h.sent.map((m) => m.text).join('\n')).not.toMatch(/Reply received/);
+  });
+
+  it('a reply to a card core no longer has is refused, not acknowledged as an outcome', async () => {
+    const { adapter, calls, arrive } = await start();
+    const id = await adapter.deliver(OWNER, null, card('appr-N', 'Install jq?'));
+    h.render = undefined;
+    await arrive(approveReply(id));
+    expect(calls.action).toHaveLength(0);
+    expect(h.sent.at(-1).text).toMatch(/no longer waiting/);
+  });
+
+  it('an answer stands when its acknowledgement cannot be sent: read, not retried', async () => {
+    const { adapter, calls, arrive } = await start();
+    const id = await adapter.deliver(OWNER, null, card('appr-S', 'Install jq?'));
+    const reply = approveReply(id);
+    h.sendFail = true;
+    const uid = await arrive(reply);
+    expect(calls.action.map((a) => a[0])).toEqual(['appr-S']);
+    expect(h.flags).toEqual([[uid, ['\\Seen']]]);
+    expect(JSON.parse(fs.readFileSync(STATE, 'utf8')).retry).toEqual({});
+  });
+
+  it('many new cards never push out an unanswered one', async () => {
+    const { adapter, calls, arrive } = await start();
+    const id = await adapter.deliver(OWNER, null, card('appr-OLD', 'Install jq?'));
+    for (let i = 0; i < 70; i++) await adapter.deliver(`new${i}@example.net`, null, card(`reg-${i}`, 'New sender'));
+    await arrive(approveReply(id));
+    expect(calls.action.map((a) => a[0])).toEqual(['appr-OLD']);
+  });
+
+  it('notices carry Auto-Submitted: auto-replied, agent mail auto-generated', async () => {
+    const { adapter, arrive } = await start();
+    const id = await adapter.deliver(OWNER, null, card('appr-H', 'Install jq?'));
+    await arrive(approveReply(id));
+    await adapter.deliver(OWNER, null, { kind: 'chat', content: { text: 'Done' } });
+    expect(h.sent.map((m) => m.headers['Auto-Submitted'])).toEqual([
+      'auto-generated',
+      'auto-replied',
+      'auto-generated',
+    ]);
+  });
+});
+
+describe('startup', () => {
+  it('reads no mail until the first poll after setup, so nothing is marked read before the host routes', async () => {
+    const { calls, arrive } = await start({ firstPoll: false });
+    const uid = await arrive(mail({ body: 'early' }));
+    expect(calls.inbound).toHaveLength(0);
+    expect(h.flags).toEqual([]);
+    expect(JSON.parse(fs.readFileSync(STATE, 'utf8')).lastUid).toBe(0);
+    await firstPoll();
+    expect(calls.inbound.map((m) => m.content.text)).toEqual(['early']);
+    expect(h.flags).toEqual([[uid, ['\\Seen']]]);
+  });
+});
+
+describe('sender and size limits', () => {
+  const withAttachment = (from = OWNER) =>
+    Buffer.from(
+      [
+        PASS,
+        `From: ${from}`,
+        'To: assistant@pm.me',
+        'Subject: Report',
+        'Message-ID: <att1@example.org>',
+        'Content-Type: multipart/mixed; boundary="b1"',
+        '',
+        '--b1',
+        'Content-Type: text/plain; charset=utf-8',
+        '',
+        'see attached',
+        '--b1',
+        'Content-Type: application/pdf; name="r.pdf"',
+        'Content-Disposition: attachment; filename="r.pdf"',
+        'Content-Transfer-Encoding: base64',
+        '',
+        Buffer.from('%PDF-1.4').toString('base64'),
+        '--b1--',
+        '',
+      ].join('\r\n'),
+    );
+
+  it('refuses a quoted local part that would read as another channel’s id', async () => {
+    const { calls, arrive } = await start();
+    await arrive(mail({ from: '"imessage:x"@example.org', body: 'hi' }));
+    expect(calls.inbound).toHaveLength(0);
+  });
+
+  it('shows approvers the verified address beside the display name', async () => {
+    const { calls, arrive } = await start();
+    await arrive(mail({ from: `The Owner <${OWNER}>`, body: 'hi' }));
+    expect(calls.inbound[0].content.senderName).toBe(`The Owner <${OWNER}>`);
+    expect(calls.metadata[0]).toEqual([OWNER, `The Owner <${OWNER}>`, false]);
+  });
+
+  it('holds back attachments until the sender is approved', async () => {
+    h.wired = false;
+    const { calls, arrive } = await start();
+    await arrive(withAttachment());
+    expect(calls.inbound[0].content.attachments).toBeUndefined();
+    expect(calls.inbound[0].content.text).toMatch(/r\.pdf \(sender not yet approved/);
+    h.wired = true;
+    await arrive(withAttachment());
+    expect(calls.inbound[1].content.attachments).toEqual([
+      { type: 'document', name: 'r.pdf', data: Buffer.from('%PDF-1.4').toString('base64') },
+    ]);
+  });
+
+  it('caps an oversized subject and replaces an oversized Message-ID', async () => {
+    const { calls, arrive } = await start();
+    const long = 'S'.repeat(5000);
+    await arrive(
+      Buffer.from(
+        [PASS, `From: ${OWNER}`, `Subject: ${long}`, `Message-ID: <${'m'.repeat(2000)}@example.org>`, '', 'hi'].join(
+          '\r\n',
+        ),
+      ),
+    );
+    const state = JSON.parse(fs.readFileSync(STATE, 'utf8'));
+    expect(calls.inbound[0].content.subject.length).toBeLessThanOrEqual(300);
+    expect(state.threads[OWNER].messageId).toMatch(/^<mail-1-\d+@nanoclaw\.local>$/);
+  });
+});
+
+describe('retries', () => {
+  // Retries cover what fails inside the adapter (fetch, parse, card lookup,
+  // a refusal notice). Routing runs in the host after the hand-over and is
+  // not retried — the fake onInbound, like the host's, never throws.
+  it('a mail whose fetch failed is retried, and only marked read once handled', async () => {
+    h.fetchFail.add(1);
+    const { calls, arrive } = await start();
     const uid = await arrive(mail({ subject: 'Hello', body: 'first' }));
     expect(h.flags).toEqual([]);
     const state = JSON.parse(fs.readFileSync(STATE, 'utf8'));
@@ -278,7 +456,7 @@ describe('retries', () => {
     fs.writeFileSync(STATE, JSON.stringify(state));
     vi.resetModules();
     h.imaps = [];
-    fail = false;
+    h.fetchFail.clear();
     const again = await start();
     h.mailbox = [{ uid, source: h.mailbox[0].source }];
     await again.poll();
@@ -287,19 +465,25 @@ describe('retries', () => {
     expect(calls.inbound).toHaveLength(0);
   });
 
+  it('a refusal notice that could not be sent is retried', async () => {
+    const { adapter, arrive } = await start();
+    await adapter.deliver(OWNER, null, card('appr-R', 'Install jq?'));
+    h.sendFail = true;
+    const uid = await arrive(mail({ subject: 'Re: Install jq?', body: '/approve' }));
+    expect(JSON.parse(fs.readFileSync(STATE, 'utf8')).retry[uid].attempts).toBe(1);
+    expect(h.flags).toEqual([]);
+  });
+
   it('gives up after five attempts: left unread and flagged, later mail still flows', async () => {
-    const { arrive } = await start(async (m) => {
-      if (m.content.text.startsWith('poison')) throw new Error('always');
-    });
+    h.fetchFail.add(1);
+    const { arrive } = await start();
     const bad = await arrive(mail({ body: 'poison' }));
     for (let i = 0; i < 4; i++) {
       const state = JSON.parse(fs.readFileSync(STATE, 'utf8'));
       state.retry[bad].nextAt = new Date(0).toISOString();
       fs.writeFileSync(STATE, JSON.stringify(state));
       vi.resetModules();
-      const r = await start(async (m) => {
-        if (m.content.text.startsWith('poison')) throw new Error('always');
-      });
+      const r = await start();
       h.mailbox = h.mailbox.slice(0, 1);
       await r.poll();
     }

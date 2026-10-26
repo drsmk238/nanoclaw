@@ -18,10 +18,14 @@ import {
   singleSender,
   tlsOptions,
   type CardRef,
-  htmlToText,
+  isPlainAddress,
   matchCommandReply,
   normalizeAddress,
+  optionCommands,
   optionToCommand,
+  pollIntervalMs,
+  safeMessageId,
+  senderLabel,
   renderAskQuestion,
   replySubject,
   shouldSkipInbound,
@@ -79,10 +83,24 @@ describe('stripQuotedReply', () => {
   });
 });
 
-describe('htmlToText', () => {
-  it('flattens tags and entities', () => {
-    const html = '<html><style>p{}</style><body><p>Hi &amp; bye</p><div>Line<br>two</div></body></html>';
-    expect(htmlToText(html)).toBe('Hi & bye\nLine\ntwo');
+describe('header caps', () => {
+  it('keeps a normal Message-ID and drops an oversized or spaced one', () => {
+    expect(safeMessageId(' <a@b.c> ')).toBe('<a@b.c>');
+    expect(safeMessageId(`<${'x'.repeat(300)}@b.c>`)).toBeUndefined();
+    expect(safeMessageId('<a b@c.d>')).toBeUndefined();
+    expect(safeMessageId(undefined)).toBeUndefined();
+  });
+});
+
+describe('pollIntervalMs', () => {
+  it('takes an in-range whole number of seconds, else the default', () => {
+    expect(pollIntervalMs(undefined)).toBe(60_000);
+    expect(pollIntervalMs('30')).toBe(30_000);
+    expect(pollIntervalMs('-5')).toBe(60_000);
+    expect(pollIntervalMs('0')).toBe(60_000);
+    expect(pollIntervalMs('2.5')).toBe(60_000);
+    expect(pollIntervalMs('abc')).toBe(60_000);
+    expect(pollIntervalMs('99999')).toBe(60_000);
   });
 });
 
@@ -155,6 +173,15 @@ describe('ask_question over email', () => {
     expect(matchCommandReply('/maybe', options)).toBeUndefined();
     expect(matchCommandReply('', options)).toBeUndefined();
   });
+
+  it('gives duplicate and empty labels distinct commands, so no option shadows another', () => {
+    const agents = normalizeOptions(['Cancel', 'Research', 'Cancel', '✅', 'cancel-2']);
+    expect(optionCommands(agents)).toEqual(['/cancel', '/research', '/cancel-2', '/option-4', '/cancel-2-2']);
+    expect(matchCommandReply('/cancel-2', agents)).toBe(agents[2]);
+    expect(matchCommandReply('/cancel-2-2', agents)).toBe(agents[4]);
+    expect(matchCommandReply('/option-4', agents)).toBe(agents[3]);
+    expect(renderAskQuestion('Pick', 'Which agent?', agents)).toContain('  /cancel-2\n');
+  });
 });
 
 describe('frameInbound', () => {
@@ -218,6 +245,33 @@ describe('singleSender', () => {
   });
   it('refuses a missing sender', () => {
     expect(singleSender(undefined)).toEqual({ reason: 'no sender' });
+  });
+  it('refuses a quoted local part, which would read as another channel’s user id', () => {
+    expect(singleSender(addr({ address: '"imessage:x"@example.com' }))).toEqual({ reason: 'not a plain address' });
+  });
+});
+
+describe('isPlainAddress', () => {
+  it('takes dot-atom addresses, UTF-8 included', () => {
+    expect(isPlainAddress('a.b+tag@mail.example.co.uk')).toBe(true);
+    expect(isPlainAddress("o'brien@example.ie")).toBe(true);
+    expect(isPlainAddress('jürgen@bücher.de')).toBe(true);
+  });
+  it('refuses quoted local parts, domain literals and stray characters', () => {
+    expect(isPlainAddress('"imessage:x"@example.com')).toBe(false);
+    expect(isPlainAddress('imessage:x@example.com')).toBe(false);
+    expect(isPlainAddress('x@[127.0.0.1]')).toBe(false);
+    expect(isPlainAddress('a..b@example.com')).toBe(false);
+    expect(isPlainAddress('a b@example.com')).toBe(false);
+    expect(isPlainAddress('x@localhost')).toBe(false);
+  });
+});
+
+describe('senderLabel', () => {
+  it('shows the verified address after the display name', () => {
+    expect(senderLabel('owner@example.org', 'Owner')).toBe('Owner <owner@example.org>');
+    expect(senderLabel('owner@example.org', 'Fake <boss@corp.test>')).toBe('Fake boss@corp.test <owner@example.org>');
+    expect(senderLabel('owner@example.org')).toBe('owner@example.org');
   });
 });
 

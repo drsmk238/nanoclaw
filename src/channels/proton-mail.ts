@@ -33,6 +33,8 @@ import { simpleParser, type AddressObject, type ParsedMail } from 'mailparser';
 import nodemailer, { type Transporter } from 'nodemailer';
 
 import { isSafeAttachmentName } from '../attachment-safety.js';
+import { STORE_DIR } from '../config.js';
+import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
 import type {
@@ -47,14 +49,25 @@ import { normalizeOptions, type NormalizedOption } from './ask-question.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import { resolveQuestionRender } from './question-render-registry.js';
 
-const STATE_DIR = path.join(process.cwd(), 'store', 'proton-mail');
+const STATE_DIR = path.join(STORE_DIR, 'proton-mail');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const THREADS_MAX = 512;
+/** Answered and closed cards beyond this many are pruned, oldest first. */
 const CARDS_MAX = 64;
+/** Unanswered cards stay until their TTL; this ceiling only stops a flood growing the state file without bound. */
+const CARDS_HARD_MAX = 1000;
 const CARD_TTL_MS = 7 * 24 * 60 * 60_000;
 const ATTACHMENT_MAX_BYTES = 15 * 1024 * 1024;
+const ATTACHMENTS_TOTAL_MAX_BYTES = 25 * 1024 * 1024;
 const MESSAGE_MAX_BYTES = 40 * 1024 * 1024;
 const BODY_MAX_CHARS = 50_000;
+const SUBJECT_MAX_CHARS = 300;
+/** RFC 5322 caps a header line at 998 characters; a real Message-ID is far shorter. */
+const MESSAGE_ID_MAX_CHARS = 250;
+const REFERENCES_MAX = 20;
+const POLL_SECONDS_DEFAULT = 60;
+const POLL_SECONDS_MIN = 10;
+const POLL_SECONDS_MAX = 3600;
 const RECONNECT_DELAY_MS = 5_000;
 const RECONNECT_MAX_MS = 5 * 60_000;
 const RETRY_MAX_ATTEMPTS = 5;
@@ -139,23 +152,6 @@ export function stripQuotedReply(text: string): string {
   }
   const out = kept.join('\n').trim();
   return out || text.trim();
-}
-
-/** Crude text extraction for HTML-only mail; mailparser only fills `text` from a text/plain part. */
-export function htmlToText(html: string): string {
-  return html
-    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, '')
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/(p|div|li|tr|h[1-6]|blockquote)>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
 }
 
 /**
@@ -248,6 +244,26 @@ export function checkSenderAuth(fromAddress: string, authResults: string[]): str
   return null;
 }
 
+const ATEXT = "[\\p{L}\\p{N}!#$%&'*+/=?^_`{|}~-]+";
+const LABEL = '[\\p{L}\\p{N}](?:[\\p{L}\\p{N}-]*[\\p{L}\\p{N}])?';
+const PLAIN_ADDRESS_RE = new RegExp(`^${ATEXT}(?:\\.${ATEXT})*@${LABEL}(?:\\.${LABEL})+$`, 'u');
+
+/**
+ * A plain `local@domain` address: a dot-atom local part (RFC 5322 §3.2.3,
+ * UTF-8 letters allowed) and a domain of dotted labels. Quoted local parts and
+ * domain literals are refused: `"imessage:x"@example.com` carries a `:`, and
+ * the host reads a handle with a `:` as another channel's user id.
+ */
+export function isPlainAddress(address: string): boolean {
+  return PLAIN_ADDRESS_RE.test(address);
+}
+
+/** How a sender is shown to approvers and agents: the verified address, after the display name if there is one. */
+export function senderLabel(address: string, name?: string): string {
+  const n = name ? oneLine(name.replace(/[<>"]/g, ''), 100) : '';
+  return n ? `${n} <${address}>` : address;
+}
+
 /**
  * The one sender of a mail, or the reason there isn't one. A From with
  * several addresses is refused: DMARC can only be aligned with one of them,
@@ -261,7 +277,9 @@ export function singleSender(
   const withAddress = values.filter((v) => !!v.address);
   if (withAddress.length === 0) return { reason: 'no sender' };
   if (withAddress.length > 1 || values.length > 1) return { reason: 'more than one From address' };
-  return { address: normalizeAddress(withAddress[0].address!), name: withAddress[0].name || undefined };
+  const address = normalizeAddress(withAddress[0].address!);
+  if (!isPlainAddress(address)) return { reason: 'not a plain address' };
+  return { address, name: withAddress[0].name || undefined };
 }
 
 export function classifyAttachment(contentType: string | undefined): string {
@@ -308,6 +326,23 @@ export function cardSubject(token: string, title: string): string {
   return `[${token}] ${oneLine(title)}`;
 }
 
+/**
+ * The reply command for each option, in order, all distinct: a label that
+ * slugs to nothing becomes `/option-N`, and a repeat (two agents both named
+ * "Cancel", say) gets `-2`, `-3`…, so no option shadows another.
+ */
+export function optionCommands(options: NormalizedOption[]): string[] {
+  const used = new Set<string>();
+  return options.map((o, i) => {
+    const base = optionToCommand(o.label);
+    const stem = base === '/' ? `/option-${i + 1}` : base;
+    let cmd = stem;
+    for (let n = 2; used.has(cmd); n++) cmd = `${stem}-${n}`;
+    used.add(cmd);
+    return cmd;
+  });
+}
+
 /** Render an ask_question card as a plain-text mail body with slash-command replies. */
 export function renderAskQuestion(
   title: string,
@@ -315,7 +350,9 @@ export function renderAskQuestion(
   options: NormalizedOption[],
   token?: string,
 ): string {
-  const optionLines = options.map((o) => `  ${optionToCommand(o.label)}`).join('\n');
+  const optionLines = optionCommands(options)
+    .map((c) => `  ${c}`)
+    .join('\n');
   const how = token
     ? 'Reply to this email, keeping its subject, with one of these on the first line:'
     : 'Reply with one of:';
@@ -334,7 +371,8 @@ export function matchCommandReply(body: string, options: NormalizedOption[]): No
   const first = firstLine(body);
   if (!first || !first.startsWith('/')) return undefined;
   const cmd = first.split(/\s+/)[0].toLowerCase();
-  return options.find((o) => optionToCommand(o.label) === cmd);
+  const i = optionCommands(options).indexOf(cmd);
+  return i >= 0 ? options[i] : undefined;
 }
 
 /** A card the adapter mailed and may still take an answer for. */
@@ -349,6 +387,8 @@ export interface CardRef {
   options: NormalizedOption[];
   sentAt: string;
   answeredAt?: string;
+  /** Core closed the card without an answer from here (a gateway approval that timed out, say). */
+  closedAt?: string;
 }
 
 export type CardReplyMatch =
@@ -378,7 +418,8 @@ export function matchCardReply(input: {
     const looksLikeAnswer =
       isCommand &&
       Object.values(input.cards).some(
-        (c) => !c.answeredAt && c.address === input.fromAddress && matchCommandReply(input.body, c.options),
+        (c) =>
+          !c.answeredAt && !c.closedAt && c.address === input.fromAddress && matchCommandReply(input.body, c.options),
       );
     return looksLikeAnswer
       ? { kind: 'refused', reason: 'it does not carry the request’s reference', notify: true }
@@ -392,6 +433,7 @@ export function matchCardReply(input: {
   if (!card) return { kind: 'refused', reason: 'that request is no longer waiting', notify: knownApprover, token };
   if (card.address !== input.fromAddress) return { kind: 'refused', reason: 'not the approver', notify: false, token };
   if (card.answeredAt) return { kind: 'refused', reason: 'that request was already answered', notify: true, token };
+  if (card.closedAt) return { kind: 'refused', reason: 'that request is no longer waiting', notify: true, token };
   if (input.inReplyTo !== card.messageId)
     return { kind: 'refused', reason: 'it is not a reply to the request email itself', notify: true, token };
   const option = matchCommandReply(input.body, card.options);
@@ -512,13 +554,48 @@ function pruneCards(state: AdapterState, now = Date.now()): void {
   for (const [token, card] of Object.entries(state.cards)) {
     if (now - Date.parse(card.sentAt) > CARD_TTL_MS) delete state.cards[token];
   }
-  const tokens = Object.keys(state.cards);
-  if (tokens.length > CARDS_MAX) {
-    tokens
-      .sort((a, b) => state.cards[a].sentAt.localeCompare(state.cards[b].sentAt))
-      .slice(0, tokens.length - CARDS_MAX)
-      .forEach((t) => delete state.cards[t]);
+  // Over the cap, answered and closed cards go, oldest first. An unanswered
+  // card stays until its TTL, so mail from many new addresses cannot push out
+  // a card whose answer is still to come.
+  const byAge = Object.keys(state.cards).sort((a, b) => state.cards[a].sentAt.localeCompare(state.cards[b].sentAt));
+  let excess = byAge.length - CARDS_MAX;
+  for (const t of byAge) {
+    if (excess <= 0) break;
+    if (state.cards[t].answeredAt || state.cards[t].closedAt) {
+      delete state.cards[t];
+      excess--;
+    }
   }
+  const left = byAge.filter((t) => state.cards[t]);
+  if (left.length > CARDS_HARD_MAX) {
+    log.warn('Proton Mail: more unanswered cards than the ceiling — dropping the oldest', {
+      cards: left.length,
+      ceiling: CARDS_HARD_MAX,
+    });
+    left.slice(0, left.length - CARDS_HARD_MAX).forEach((t) => delete state.cards[t]);
+  }
+}
+
+/** A Message-ID fit to store and send back in headers: within the cap, no whitespace. */
+export function safeMessageId(id: string | undefined): string | undefined {
+  const v = id?.trim();
+  return v && v.length <= MESSAGE_ID_MAX_CHARS && !/\s/.test(v) ? v : undefined;
+}
+
+/** PROTON_MAIL_POLL_SECONDS as milliseconds; unset or out of range gives the default. */
+export function pollIntervalMs(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return POLL_SECONDS_DEFAULT * 1000;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < POLL_SECONDS_MIN || n > POLL_SECONDS_MAX) {
+    log.warn('Proton Mail: PROTON_MAIL_POLL_SECONDS out of range — using the default', {
+      value: raw,
+      min: POLL_SECONDS_MIN,
+      max: POLL_SECONDS_MAX,
+      default: POLL_SECONDS_DEFAULT,
+    });
+    return POLL_SECONDS_DEFAULT * 1000;
+  }
+  return n * 1000;
 }
 
 function allAddresses(obj: AddressObject | AddressObject[] | undefined): string[] {
@@ -591,7 +668,7 @@ registerChannelAdapter('proton-mail', {
       smtpHost: env.PROTON_MAIL_SMTP_HOST || '127.0.0.1',
       smtpPort: Number(env.PROTON_MAIL_SMTP_PORT) || 1025,
       mailbox: env.PROTON_MAIL_MAILBOX || 'INBOX',
-      pollMs: (Number(env.PROTON_MAIL_POLL_SECONDS) || 60) * 1000,
+      pollMs: pollIntervalMs(env.PROTON_MAIL_POLL_SECONDS),
       markSeen: env.PROTON_MAIL_MARK_SEEN !== 'false',
       processBacklog: env.PROTON_MAIL_PROCESS_BACKLOG === 'true',
       defaultSubject: env.PROTON_MAIL_DEFAULT_SUBJECT || 'Message from your assistant',
@@ -614,6 +691,8 @@ registerChannelAdapter('proton-mail', {
     let transporter: Transporter | undefined;
     let connected = false;
     let shuttingDown = false;
+    /** False until the first poll after setup(): see setup(). */
+    let accepting = false;
     let draining = false;
     let drainAgain = false;
     let reconnectDelay = RECONNECT_DELAY_MS;
@@ -644,6 +723,11 @@ registerChannelAdapter('proton-mail', {
       subject?: string;
       /** Thread onto this mail instead of the conversation's last one. */
       inReplyTo?: string;
+      /**
+       * RFC 3834 Auto-Submitted: 'auto-replied' for the adapter's own notices
+       * answering a mail; everything else an agent sends is 'auto-generated'.
+       */
+      autoSubmitted?: 'auto-replied' | 'auto-generated';
     }
 
     async function sendMail(
@@ -663,7 +747,7 @@ registerChannelAdapter('proton-mail', {
         subject: opts.subject ?? (thread ? replySubject(thread.subject) : cfg.defaultSubject),
         text,
         attachments: files,
-        headers: { 'X-NanoClaw-Agent': 'proton-mail' },
+        headers: { 'X-NanoClaw-Agent': 'proton-mail', 'Auto-Submitted': opts.autoSubmitted ?? 'auto-generated' },
         ...(inReplyTo && { inReplyTo, references: [...new Set(references)].join(' ') || inReplyTo }),
       });
       const sentId: string | undefined = info?.messageId;
@@ -672,7 +756,7 @@ registerChannelAdapter('proton-mail', {
         // mail (a scheduled task, say) lands in the same conversation.
         rememberThread(state, addr, {
           messageId: sentId,
-          references: [...references, sentId].slice(-20),
+          references: [...references, sentId].slice(-REFERENCES_MAX),
           subject: thread?.subject ?? cfg.defaultSubject,
           name: thread?.name,
         });
@@ -682,6 +766,22 @@ registerChannelAdapter('proton-mail', {
     }
 
     // --- Inbound ---
+
+    /**
+     * Whether mail from this address already reaches an agent: its DM is
+     * wired and not denied. Until then a mail only raises an approval card,
+     * and the host keeps the whole event with the pending approval.
+     */
+    async function senderApproved(addr: string): Promise<boolean> {
+      const mg = await getMessagingGroupByPlatform('proton-mail', addr);
+      if (!mg || mg.denied_at) return false;
+      return (await getMessagingGroupAgents(mg.id)).length > 0;
+    }
+
+    /** The adapter's own notice answering an inbound mail, on that mail's thread. */
+    function sendNotice(to: string, text: string, subject: string, inReplyTo: string): Promise<string | undefined> {
+      return sendMail(to, text, [], { thread: 'own', subject, inReplyTo, autoSubmitted: 'auto-replied' });
+    }
 
     /** 'done': handled (or deliberately dropped); 'leave-unread': refused, for a human to look at. */
     type Outcome = 'done' | 'leave-unread';
@@ -719,14 +819,23 @@ registerChannelAdapter('proton-mail', {
         return 'leave-unread';
       }
 
-      const rawText = parsed.text || (parsed.html ? htmlToText(parsed.html) : '');
+      // mailparser fills `text` for HTML-only mail too (html-to-text, with its
+      // own nesting limit), so there is no HTML handling here.
+      const rawText = parsed.text ?? '';
       let body = stripQuotedReply(rawText);
       if (body.length > BODY_MAX_CHARS) {
         body = body.slice(0, BODY_MAX_CHARS) + `\n\n[… truncated, ${rawText.length} characters in total]`;
       }
-      const subject = parsed.subject?.trim() || undefined;
-      const senderName = sender.name || fromAddr;
-      const messageId = parsed.messageId || `<mail-${state.uidValidity ?? 0}-${uid}@nanoclaw.local>`;
+      // Subject, Message-ID and References come from any sender and are kept
+      // in the state file and sent back in headers, so each is capped.
+      const subject = parsed.subject ? oneLine(parsed.subject, SUBJECT_MAX_CHARS) || undefined : undefined;
+      const senderName = senderLabel(fromAddr, sender.name);
+      const messageId = safeMessageId(parsed.messageId) ?? `<mail-${state.uidValidity ?? 0}-${uid}@nanoclaw.local>`;
+      const references = [parsed.references ?? []]
+        .flat()
+        .map((r) => safeMessageId(r))
+        .filter((r): r is string => !!r)
+        .slice(-(REFERENCES_MAX - 1));
 
       const match = matchCardReply({
         cards: state.cards,
@@ -735,62 +844,95 @@ registerChannelAdapter('proton-mail', {
         body,
         inReplyTo: parsed.inReplyTo,
       });
+      const refuse = async (reason: string, notify: boolean): Promise<Outcome> => {
+        log.warn('Proton Mail: reply not taken as a card answer', { uid, from: fromAddr, reason });
+        if (notify) {
+          await sendNotice(
+            fromAddr,
+            `That reply was not taken as an answer: ${reason}.\n\nTo answer, reply to the request email itself, keeping its subject, with the command on the first line.`,
+            replySubject(subject),
+            messageId,
+          );
+        }
+        return 'done';
+      };
+
       if (match.kind === 'answer') {
         const { card, option, token } = match;
         // Read the render metadata before onAction, which may delete its row.
-        const render = await resolveQuestionRender(card.questionId).catch(() => undefined);
+        // A lookup that throws is retried; no row means core no longer waits
+        // on this card (it expired or was settled elsewhere).
+        const render = await resolveQuestionRender(card.questionId);
+        if (!render) {
+          state.cards[token] = { ...card, closedAt: new Date().toISOString() };
+          saveState(state);
+          return refuse('that request is no longer waiting', true);
+        }
         setupConfig.onAction(card.questionId, option.value, fromAddr, {
           messageId: card.messageId,
           platformId: card.address,
         });
         state.cards[token] = { ...card, answeredAt: new Date().toISOString() };
         saveState(state);
+        log.info('Proton Mail card answered', { questionId: card.questionId, value: option.value });
         // Gateway approvals: core records the decision and then edits the
         // card, which arrives here as the confirmation. Otherwise, like the
         // chat-sdk bridge, acknowledge the reply — without claiming an
-        // outcome this adapter cannot see.
-        if (!render?.deferResolution) {
-          await sendMail(fromAddr, `Reply received: ${option.selectedLabel}\n\n${card.title}`, [], {
-            thread: 'own',
-            subject: replySubject(card.subject),
-            inReplyTo: messageId,
-          });
-        }
-        log.info('Proton Mail card answered', { questionId: card.questionId, value: option.value });
-        return 'done';
-      }
-      if (match.kind === 'refused') {
-        log.warn('Proton Mail: reply not taken as a card answer', { uid, from: fromAddr, reason: match.reason });
-        if (match.notify) {
-          await sendMail(
-            fromAddr,
-            `That reply was not taken as an answer: ${match.reason}.\n\nTo answer, reply to the request email itself, keeping its subject, with the command on the first line.`,
-            [],
-            { thread: 'own', subject: replySubject(subject), inReplyTo: messageId },
-          );
+        // outcome this adapter cannot see. The answer is already taken, so a
+        // failed acknowledgement is logged, not retried: a retry would only
+        // find the card answered and tell the approver it was not.
+        if (!render.deferResolution) {
+          try {
+            await sendNotice(
+              fromAddr,
+              `Reply received: ${option.selectedLabel}\n\n${card.title}`,
+              replySubject(card.subject),
+              messageId,
+            );
+          } catch (err) {
+            log.warn('Proton Mail: card answered, but the acknowledgement could not be sent', {
+              questionId: card.questionId,
+              err,
+            });
+          }
         }
         return 'done';
       }
+      if (match.kind === 'refused') return refuse(match.reason, match.notify);
 
       // A mail on a card's thread (a reason after "Reject with reason…", say)
       // goes to the agent but does not become the conversation thread.
       if (!CARD_TOKEN_RE.test(subject ?? '')) {
         rememberThread(state, fromAddr, {
           messageId,
-          references: [...(parsed.references ? [parsed.references].flat() : []), messageId].slice(-20),
+          references: [...references, messageId],
           subject,
           name: sender.name,
         });
       }
 
+      // Attachments only from an address already approved: until then the
+      // host stores the whole event with the pending approval, and a stranger
+      // should not be able to park 40 MB there per new address.
       const attachments: Array<{ type: string; name: string; data: string }> = [];
       const failures: string[] = [];
+      const approved = (parsed.attachments ?? []).length > 0 && (await senderApproved(fromAddr));
+      let totalBytes = 0;
       for (const att of parsed.attachments ?? []) {
         const type = classifyAttachment(att.contentType);
+        if (!approved) {
+          failures.push(`${att.filename ?? type} (sender not yet approved — ask them to send it again)`);
+          continue;
+        }
         if (att.size > ATTACHMENT_MAX_BYTES) {
           failures.push(`${att.filename ?? type} (too large)`);
           continue;
         }
+        if (totalBytes + att.size > ATTACHMENTS_TOTAL_MAX_BYTES) {
+          failures.push(`${att.filename ?? type} (over the total size limit)`);
+          continue;
+        }
+        totalBytes += att.size;
         const fallback = `${type}-${uid}-${attachments.length + 1}`;
         const rawName = att.filename ?? '';
         const name = isSafeAttachmentName(rawName) ? rawName : fallback;
@@ -827,6 +969,9 @@ registerChannelAdapter('proton-mail', {
         // When the mail reached the mailbox, not the sender's own Date header.
         timestamp: (internalDate ?? parsed.date ?? new Date()).toISOString(),
       };
+      // The host queues routing and catches its own errors, so this returns
+      // once the mail is handed over; a routing failure inside the host is
+      // logged there and not seen here.
       await setupConfig.onInbound(fromAddr, null, inbound);
       return 'done';
     }
@@ -881,7 +1026,10 @@ registerChannelAdapter('proton-mail', {
         await recordFailure(uid, err);
       }
       // The cursor moves on either way, so one bad mail never holds up the
-      // rest; a failed one waits in `retry`.
+      // rest; a failed one waits in `retry`. Retries cover what fails here —
+      // fetching, parsing, the card lookup, sending a refusal notice. Routing
+      // runs inside the host after the hand-over, so a routing failure there
+      // is not retried: the mail is already marked read.
       state.lastUid = Math.max(state.lastUid ?? 0, uid);
       saveState(state);
       if (outcome === 'done' && cfg.markSeen) await flag(uid, ['\\Seen']);
@@ -895,7 +1043,7 @@ registerChannelAdapter('proton-mail', {
      * one message at a time keeps a large backlog out of memory.
      */
     async function drain(): Promise<void> {
-      if (!client || !connected) return;
+      if (!accepting || !client || !connected) return;
       if (draining) {
         drainAgain = true;
         return;
@@ -1005,9 +1153,9 @@ registerChannelAdapter('proton-mail', {
       }
     }
 
-    function cardByMessageId(messageId: unknown): CardRef | undefined {
+    function cardByMessageId(messageId: unknown): [string, CardRef] | undefined {
       if (typeof messageId !== 'string') return undefined;
-      return Object.values(state.cards).find((c) => c.messageId === messageId);
+      return Object.entries(state.cards).find(([, c]) => c.messageId === messageId);
     }
 
     const adapter: ChannelAdapter = {
@@ -1019,9 +1167,17 @@ registerChannelAdapter('proton-mail', {
         setupConfig = config;
         fs.mkdirSync(STATE_DIR, { recursive: true });
         await connect();
-        // IDLE delivers `exists` promptly; the poll is the safety net for a
-        // bridge that drops IDLE or a missed notification, and runs retries.
-        pollTimer = setInterval(() => void drain(), cfg.pollMs);
+        // No mail is read until the first poll, one interval after setup().
+        // The host holds routing until its own startup finishes, after
+        // setup() returns; mail drained before then would be marked read
+        // while its routing waited in memory, and lost on a stop or crash.
+        // IDLE delivers `exists` promptly after that; the poll is the safety
+        // net for a bridge that drops IDLE or a missed notification, and
+        // runs retries.
+        pollTimer = setInterval(() => {
+          accepting = true;
+          void drain();
+        }, cfg.pollMs);
       },
 
       async deliver(platformId: string, _threadId: string | null, message: OutboundMessage) {
@@ -1064,8 +1220,16 @@ registerChannelAdapter('proton-mail', {
         if (content.operation === 'edit') {
           const text = ((content.markdown as string) || (content.text as string) || '').trim();
           if (!text) return;
-          const card = cardByMessageId(content.messageId);
-          if (card) {
+          const found = cardByMessageId(content.messageId);
+          if (found) {
+            const [token, card] = found;
+            // Core's resolution (terminalCard) closes the card: a gateway
+            // approval that timed out is gone from the host, so a later reply
+            // must be refused, not acknowledged.
+            if (content.terminalCard && !card.answeredAt && !card.closedAt) {
+              state.cards[token] = { ...card, closedAt: new Date().toISOString() };
+              saveState(state);
+            }
             return sendMail(platformId, text, [], {
               thread: 'own',
               subject: replySubject(card.subject),
