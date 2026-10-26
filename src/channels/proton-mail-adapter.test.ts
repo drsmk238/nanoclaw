@@ -114,11 +114,13 @@ const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'proton-mail-test-'));
 const STORE = path.join(SCRATCH, 'store', 'proton-mail');
 const STATE = path.join(STORE, 'state.json');
 
-const tick = () => new Promise((r) => setTimeout(r, 100));
+// The adapter's timers are faked; the test's own waits use the real ones.
+const realSetTimeout = globalThis.setTimeout;
+const tick = () => new Promise((r) => realSetTimeout(r, 100));
 
-/** The first poll, one interval after setup(): only then does the adapter read mail. */
+/** The startup delay after setup() (30 s): only then does the adapter read mail. */
 async function firstPoll() {
-  vi.advanceTimersByTime(60_000);
+  vi.advanceTimersByTime(30_000);
   await tick();
 }
 
@@ -186,7 +188,7 @@ beforeEach(() => {
   h.sendFail = false;
   h.wired = true;
   // Only the poll interval is faked; the tick() waits stay real.
-  vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
   fs.rmSync(STORE, { recursive: true, force: true });
 });
 
@@ -369,7 +371,8 @@ describe('mail from another Proton account', () => {
 });
 
 describe('startup', () => {
-  it('reads no mail until the first poll after setup, so nothing is marked read before the host routes', async () => {
+  it('reads no mail until the startup delay, however long the poll interval', async () => {
+    h.env.PROTON_MAIL_POLL_SECONDS = '3600';
     const { calls, arrive } = await start({ firstPoll: false });
     const uid = await arrive(mail({ body: 'early' }));
     expect(calls.inbound).toHaveLength(0);
@@ -378,6 +381,98 @@ describe('startup', () => {
     await firstPoll();
     expect(calls.inbound.map((m) => m.content.text)).toEqual(['early']);
     expect(h.flags).toEqual([[uid, ['\\Seen']]]);
+  });
+});
+
+describe('review of #4218 (ultrareview)', () => {
+  it('a reply keeping the conversation subject is just its body, so core’s free-text prompts get the bare answer', async () => {
+    const { adapter, calls, arrive } = await start();
+    await arrive(mail({ subject: 'Hello', body: 'first' }));
+    await adapter.deliver(OWNER, null, { kind: 'chat', content: { text: 'Reply with the name for your new agent:' } });
+    await arrive(mail({ subject: 'Re: Re: Hello', body: 'Alice' }));
+    await arrive(mail({ subject: 'Something else', body: 'new topic' }));
+    expect(calls.inbound.map((m) => m.content.text)).toEqual([
+      'first\n\nSubject: Hello',
+      'Alice',
+      'new topic\n\nSubject: Something else',
+    ]);
+  });
+
+  it('the inbound id is the adapter’s own, so a reused Message-ID cannot collide', async () => {
+    const { calls, arrive } = await start();
+    const same = (body: string) =>
+      Buffer.from([PASS, `From: ${OWNER}`, 'Subject: x', 'Message-ID: <same@example.org>', '', body].join('\r\n'));
+    await arrive(same('one'));
+    await arrive(same('two'));
+    const ids = calls.inbound.map((m) => m.id);
+    expect(new Set(ids).size).toBe(2);
+    expect(ids.every((id) => /^proton-mail-1-\d+$/.test(id))).toBe(true);
+    expect(calls.inbound.map((m) => m.content.messageId)).toEqual(['<same@example.org>', '<same@example.org>']);
+  });
+
+  it('stops a mail loop: past 20 mails an hour from one sender, mail is left unread', async () => {
+    const { calls, arrive } = await start();
+    let last = 0;
+    for (let i = 0; i < 21; i++) last = await arrive(mail({ subject: 'loop', body: `reply ${i}` }));
+    expect(calls.inbound).toHaveLength(20);
+    expect(h.flags.filter(([u]) => u === last)).toEqual([]);
+  });
+
+  it('at the card ceiling a new card is refused, and no waiting card is dropped', async () => {
+    const cards: Record<string, unknown> = {};
+    for (let i = 0; i < 1000; i++) {
+      cards[`NC-${String(i).padStart(13, 'A')}`] = {
+        questionId: `q${i}`,
+        address: OWNER,
+        messageId: `<c${i}@pm.me>`,
+        subject: 's',
+        title: 't',
+        options: [],
+        sentAt: new Date().toISOString(),
+      };
+    }
+    fs.mkdirSync(STORE, { recursive: true });
+    fs.writeFileSync(STATE, JSON.stringify({ threads: {}, cards, retry: {} }));
+    const { adapter } = await start();
+    await expect(adapter.deliver(OWNER, null, card('appr-X', 'One more?'))).rejects.toThrow(/too many unanswered/);
+    expect(h.sent).toHaveLength(0);
+    expect(Object.keys(JSON.parse(fs.readFileSync(STATE, 'utf8')).cards)).toHaveLength(1000);
+  });
+
+  it('caps the attachment names listed for a sender not yet approved', async () => {
+    h.wired = false;
+    const { calls, arrive } = await start();
+    const parts = Array.from({ length: 25 }, (_, i) =>
+      [
+        '--b1',
+        `Content-Type: application/pdf; name="${'n'.repeat(500)}${i}.pdf"`,
+        `Content-Disposition: attachment; filename="${'n'.repeat(500)}${i}.pdf"`,
+        'Content-Transfer-Encoding: base64',
+        '',
+        Buffer.from('%PDF').toString('base64'),
+      ].join('\r\n'),
+    );
+    await arrive(
+      Buffer.from(
+        [
+          PASS,
+          `From: ${OWNER}`,
+          'Subject: many',
+          'Content-Type: multipart/mixed; boundary="b1"',
+          '',
+          '--b1',
+          'Content-Type: text/plain',
+          '',
+          'files',
+          ...parts,
+          '--b1--',
+          '',
+        ].join('\r\n'),
+      ),
+    );
+    const text: string = calls.inbound[0].content.text;
+    expect(text).toMatch(/and 5 more\]$/);
+    expect(text.length).toBeLessThan(20 * 200 + 500);
   });
 });
 

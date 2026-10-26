@@ -55,8 +55,21 @@ const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const THREADS_MAX = 512;
 /** Answered and closed cards beyond this many are pruned, oldest first. */
 const CARDS_MAX = 64;
-/** Unanswered cards stay until their TTL; this ceiling only stops a flood growing the state file without bound. */
+/**
+ * Unanswered cards are never pruned before their TTL. At this many, a new card
+ * is refused instead (deliver throws), so a flood cannot push one out.
+ */
 const CARDS_HARD_MAX = 1000;
+/** How long after setup() the first drain runs: see setup(). */
+const STARTUP_DELAY_MS = 30_000;
+/**
+ * Mail taken from one sender per hour; beyond it, mail is left unread. Bridge
+ * drops every loop marker on outgoing mail, so two agents answering each
+ * other (or a responder that marks nothing) are stopped here.
+ */
+const INBOUND_PER_SENDER_PER_HOUR = 20;
+const FAILURES_LISTED_MAX = 20;
+const ADDRESSES_LISTED_MAX = 50;
 const CARD_TTL_MS = 7 * 24 * 60 * 60_000;
 const ATTACHMENT_MAX_BYTES = 15 * 1024 * 1024;
 const ATTACHMENTS_TOTAL_MAX_BYTES = 25 * 1024 * 1024;
@@ -160,14 +173,33 @@ export function stripQuotedReply(text: string): string {
   return out || text.trim();
 }
 
+/** A subject without its reply/forward prefixes, for comparing two subjects. */
+export function subjectStem(subject: string | undefined): string {
+  let s = (subject ?? '').trim();
+  for (let prev = ''; prev !== s; ) {
+    prev = s;
+    s = s.replace(/^(re|aw|sv|antw|ref|fwd?|wg)\s*:\s*/i, '');
+  }
+  return s.toLowerCase();
+}
+
 /**
  * The agent's text for an inbound mail: the body first, so a slash command
  * on the first line of a mail stays a command, then the subject on a line of
- * its own.
+ * its own — but only when it says something new. A reply keeping the
+ * conversation's subject, or a reply on a card's thread, is just its body:
+ * core reads `text` as the exact answer to its free-text prompts (a new
+ * agent's name, a reason for a rejection).
  */
-export function frameInbound(subject: string | undefined, body: string, failures: string[] = []): string {
+export function frameInbound(
+  subject: string | undefined,
+  body: string,
+  failures: string[] = [],
+  threadSubject?: string,
+): string {
   let text = body.trim();
-  if (subject) text = text ? `${text}\n\nSubject: ${subject}` : `Subject: ${subject}`;
+  const isNew = subject && !CARD_TOKEN_RE.test(subject) && subjectStem(subject) !== subjectStem(threadSubject);
+  if (isNew) text = text ? `${text}\n\nSubject: ${subject}` : `Subject: ${subject}`;
   if (failures.length > 0) text += `\n\n[attachments not delivered: ${failures.join(', ')}]`;
   return text;
 }
@@ -580,7 +612,7 @@ function pruneCards(state: AdapterState, now = Date.now()): void {
   }
   // Over the cap, answered and closed cards go, oldest first. An unanswered
   // card stays until its TTL, so mail from many new addresses cannot push out
-  // a card whose answer is still to come.
+  // a card whose answer is still to come (CARDS_HARD_MAX refuses new ones).
   const byAge = Object.keys(state.cards).sort((a, b) => state.cards[a].sentAt.localeCompare(state.cards[b].sentAt));
   let excess = byAge.length - CARDS_MAX;
   for (const t of byAge) {
@@ -590,14 +622,10 @@ function pruneCards(state: AdapterState, now = Date.now()): void {
       excess--;
     }
   }
-  const left = byAge.filter((t) => state.cards[t]);
-  if (left.length > CARDS_HARD_MAX) {
-    log.warn('Proton Mail: more unanswered cards than the ceiling — dropping the oldest', {
-      cards: left.length,
-      ceiling: CARDS_HARD_MAX,
-    });
-    left.slice(0, left.length - CARDS_HARD_MAX).forEach((t) => delete state.cards[t]);
-  }
+}
+
+function openCardCount(state: AdapterState): number {
+  return Object.values(state.cards).filter((c) => !c.answeredAt && !c.closedAt).length;
 }
 
 /** A Message-ID fit to store and send back in headers: within the cap, no whitespace. */
@@ -715,12 +743,13 @@ registerChannelAdapter('proton-mail', {
     let transporter: Transporter | undefined;
     let connected = false;
     let shuttingDown = false;
-    /** False until the first poll after setup(): see setup(). */
+    /** False until STARTUP_DELAY_MS after setup(): see setup(). */
     let accepting = false;
     let draining = false;
     let drainAgain = false;
     let reconnectDelay = RECONNECT_DELAY_MS;
     let pollTimer: NodeJS.Timeout | undefined;
+    let startTimer: NodeJS.Timeout | undefined;
     let reconnectTimer: NodeJS.Timeout | undefined;
 
     // --- Outbound ---
@@ -804,6 +833,20 @@ registerChannelAdapter('proton-mail', {
       return sendMail(to, text, [], { thread: 'own', subject, inReplyTo });
     }
 
+    /** Recent mail times per sender, for INBOUND_PER_SENDER_PER_HOUR; in memory only. */
+    const recentBySender = new Map<string, number[]>();
+
+    function withinSenderRate(addr: string, now = Date.now()): boolean {
+      const recent = (recentBySender.get(addr) ?? []).filter((t) => now - t < 60 * 60_000);
+      if (recent.length >= INBOUND_PER_SENDER_PER_HOUR) {
+        recentBySender.set(addr, recent);
+        return false;
+      }
+      recent.push(now);
+      recentBySender.set(addr, recent);
+      return true;
+    }
+
     /** 'done': handled (or deliberately dropped); 'leave-unread': refused, for a human to look at. */
     type Outcome = 'done' | 'leave-unread';
 
@@ -852,6 +895,15 @@ registerChannelAdapter('proton-mail', {
         return 'leave-unread';
       }
 
+      if (!withinSenderRate(fromAddr)) {
+        log.warn('Proton Mail: sender over the hourly limit — left unread (a mail loop?)', {
+          uid,
+          from: fromAddr,
+          perHour: INBOUND_PER_SENDER_PER_HOUR,
+        });
+        return 'leave-unread';
+      }
+
       // mailparser fills `text` for HTML-only mail too (html-to-text, with its
       // own nesting limit), so there is no HTML handling here.
       const rawText = parsed.text ?? '';
@@ -863,7 +915,10 @@ registerChannelAdapter('proton-mail', {
       // in the state file and sent back in headers, so each is capped.
       const subject = parsed.subject ? oneLine(parsed.subject, SUBJECT_MAX_CHARS) || undefined : undefined;
       const senderName = senderLabel(fromAddr, sender.name);
+      // Message-ID threads replies; it is the sender's to choose, so it is
+      // never the inbound id (see `id` below).
       const messageId = safeMessageId(parsed.messageId) ?? `<mail-${state.uidValidity ?? 0}-${uid}@nanoclaw.local>`;
+      const threadSubject = state.threads[fromAddr]?.subject;
       const references = [parsed.references ?? []]
         .flat()
         .map((r) => safeMessageId(r))
@@ -951,18 +1006,24 @@ registerChannelAdapter('proton-mail', {
       const failures: string[] = [];
       const approved = (parsed.attachments ?? []).length > 0 && (await senderApproved(fromAddr));
       let totalBytes = 0;
+      let unlisted = 0;
+      // Filenames are the sender's too: each is cut short, and only so many listed.
+      const fail = (att: { filename?: string }, type: string, why: string) => {
+        if (failures.length < FAILURES_LISTED_MAX) failures.push(`${oneLine(att.filename ?? type, 100)} (${why})`);
+        else unlisted++;
+      };
       for (const att of parsed.attachments ?? []) {
         const type = classifyAttachment(att.contentType);
         if (!approved) {
-          failures.push(`${att.filename ?? type} (sender not yet approved — ask them to send it again)`);
+          fail(att, type, 'sender not yet approved — ask them to send it again');
           continue;
         }
         if (att.size > ATTACHMENT_MAX_BYTES) {
-          failures.push(`${att.filename ?? type} (too large)`);
+          fail(att, type, 'too large');
           continue;
         }
         if (totalBytes + att.size > ATTACHMENTS_TOTAL_MAX_BYTES) {
-          failures.push(`${att.filename ?? type} (over the total size limit)`);
+          fail(att, type, 'over the total size limit');
           continue;
         }
         totalBytes += att.size;
@@ -975,14 +1036,19 @@ registerChannelAdapter('proton-mail', {
         attachments.push({ type, name, data: att.content.toString('base64') });
       }
 
-      const text = frameInbound(subject, body, failures);
+      if (unlisted > 0) failures.push(`and ${unlisted} more`);
+
+      const text = frameInbound(subject, body, failures, threadSubject);
       saveState(state);
       if (!text.trim() && attachments.length === 0) return 'done';
 
       setupConfig.onMetadata(fromAddr, senderName, false);
 
       const inbound: InboundMessage = {
-        id: messageId,
+        // Unique per mailbox and chosen here: the host stores it as a primary
+        // key, so a sender reusing a Message-ID must not make a second mail
+        // fail to route after it was marked read.
+        id: `proton-mail-${state.uidValidity ?? 0}-${uid}`,
         kind: 'chat',
         // A mail to the bridge account is addressed to the bot by definition.
         isMention: true,
@@ -993,8 +1059,8 @@ registerChannelAdapter('proton-mail', {
           senderName,
           subject,
           messageId,
-          to: allAddresses(parsed.to),
-          cc: allAddresses(parsed.cc),
+          to: allAddresses(parsed.to).slice(0, ADDRESSES_LISTED_MAX),
+          cc: allAddresses(parsed.cc).slice(0, ADDRESSES_LISTED_MAX),
           ...(attachments.length > 0 && { attachments }),
           fromMe: false,
           isGroup: false,
@@ -1200,17 +1266,20 @@ registerChannelAdapter('proton-mail', {
         setupConfig = config;
         fs.mkdirSync(STATE_DIR, { recursive: true });
         await connect();
-        // No mail is read until the first poll, one interval after setup().
-        // The host holds routing until its own startup finishes, after
-        // setup() returns; mail drained before then would be marked read
-        // while its routing waited in memory, and lost on a stop or crash.
+        // No mail is read until STARTUP_DELAY_MS after setup(). The host holds
+        // routing until its own startup finishes, after setup() returns; mail
+        // drained before then would be marked read while its routing waited
+        // in memory, and lost on a stop or crash. The adapter cannot see that
+        // moment, so this is a fixed delay, independent of the poll interval.
         // IDLE delivers `exists` promptly after that; the poll is the safety
         // net for a bridge that drops IDLE or a missed notification, and
         // runs retries.
-        pollTimer = setInterval(() => {
+        startTimer = setTimeout(() => {
+          startTimer = undefined;
           accepting = true;
           void drain();
-        }, cfg.pollMs);
+        }, STARTUP_DELAY_MS);
+        pollTimer = setInterval(() => void drain(), cfg.pollMs);
       },
 
       async deliver(platformId: string, _threadId: string | null, message: OutboundMessage) {
@@ -1222,6 +1291,16 @@ registerChannelAdapter('proton-mail', {
           if (!title) {
             log.error('ask_question missing required title — skipping delivery', { questionId });
             return;
+          }
+          // Unanswered cards are never dropped to make room: at the ceiling a
+          // new one fails to deliver, so core sees the failure and the cards
+          // already waiting keep their answers.
+          if (openCardCount(state) >= CARDS_HARD_MAX) {
+            log.error('Proton Mail: too many unanswered cards — not sending another', {
+              questionId,
+              open: CARDS_HARD_MAX,
+            });
+            throw new Error('Proton Mail: too many unanswered cards');
           }
           const options = normalizeOptions(content.options as never);
           const token = newCardToken();
@@ -1294,6 +1373,7 @@ registerChannelAdapter('proton-mail', {
         shuttingDown = true;
         connected = false;
         if (pollTimer) clearInterval(pollTimer);
+        if (startTimer) clearTimeout(startTimer);
         if (reconnectTimer) clearTimeout(reconnectTimer);
         try {
           await client?.logout();

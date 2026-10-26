@@ -30,6 +30,7 @@ import {
   replySubject,
   shouldSkipInbound,
   stripQuotedReply,
+  subjectStem,
 } from './proton-mail.js';
 import { normalizeOptions } from './ask-question.js';
 
@@ -185,6 +186,12 @@ describe('ask_question over email', () => {
 });
 
 describe('frameInbound', () => {
+  it('leaves out a subject that says nothing new: the thread’s own, or a card’s', () => {
+    expect(subjectStem('Re: AW: Fwd: Hello ')).toBe('hello');
+    expect(frameInbound('Re: Hello', 'Alice', [], 'Hello')).toBe('Alice');
+    expect(frameInbound('Re: [NC-ABCDEFGHIJKLM] Deploy?', 'too risky', [], 'Hello')).toBe('too risky');
+    expect(frameInbound('Re: Other', 'hi', [], 'Hello')).toBe('hi\n\nSubject: Re: Other');
+  });
   it('puts the body first so a slash command stays a command', () => {
     expect(frameInbound('admin', '/clear')).toBe('/clear\n\nSubject: admin');
     expect(frameInbound(undefined, 'hello')).toBe('hello');
