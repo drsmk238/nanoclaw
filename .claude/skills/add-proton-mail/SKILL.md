@@ -249,7 +249,7 @@ Tell the user what to expect:
 ```nc:operator
 Proton Mail is connected as {{proton_address}}. Send it an email from {{owner_email}} and the agent replies in the same thread.
 
-Mail counts as from {{owner_email}} only when Proton verified the sender (DMARC pass for that domain); anything else is left unread in the inbox. Mail from anyone else is held for your approval the first time they write (unknown_sender_policy: request_approval) — nothing reaches the agent until you approve the sender. Bounces, auto-replies, mailing lists and the agent's own mail are filtered out automatically.
+Mail counts as from {{owner_email}} only when Proton vouches for the sender: a DMARC pass for that domain, or, for mail from a Proton account, Proton's own mark that it came from inside Proton. Anything else is left unread in the inbox. Mail from anyone else is held for your approval the first time they write (unknown_sender_policy: request_approval) — nothing reaches the agent until you approve the sender. Bounces, auto-replies, mailing lists, mail from the agent's own address, and more than 20 mails an hour from one sender are filtered out automatically.
 
 Approval requests arrive as emails whose subject starts with a reference like [NC-…]. Answer by replying to that email itself, keeping its subject, with the command (e.g. /approve) on the first line.
 ```
@@ -258,23 +258,37 @@ Approval requests arrive as emails whose subject starts with a reference like [N
 
 What the adapter trusts, and why:
 
-- **Who a mail is from.** The `From:` header is the sender's own claim. Proton's
-  inbound servers check SPF, DKIM and DMARC alignment of the `From:` domain when
-  mail arrives and record the result in `Authentication-Results` headers under
-  their own authserv-id, `mail.protonmail.ch`; Bridge adds no verdict of its
-  own and serves those headers as Proton stored them. The adapter counts a mail
-  as from its address only when there is exactly one Proton DMARC verdict, it
-  is `pass`, and it names the `From:` domain. A forger can add their own
-  `mail.protonmail.ch` header but cannot remove Proton's, so a forgery shows two
-  verdicts and is refused. A domain's DMARC policy doesn't matter: with `p=none`
-  Proton still delivers forged mail, but records `dmarc=fail`. A `From:` with
-  more than one address is refused. Refused mail is logged and left unread.
-- **What DMARC does not prove.** DMARC vouches for a domain, not a mailbox: the
-  adapter relies on the sender's own domain to stop its users sending as each
-  other (and any shared service in the domain's SPF record widens who can send
-  for it). For the owner, use an address on a domain with tight sending
-  controls. Mail between two Proton accounts may carry no DMARC verdict and is
-  then refused.
+- **Who a mail is from.** The `From:` header is the sender's own claim, so the
+  adapter takes it only when Proton vouches for it, in one of two ways:
+  - *Mail from outside Proton.* Proton's inbound servers check SPF, DKIM and
+    DMARC alignment of the `From:` domain and record the result in
+    `Authentication-Results` headers under their own authserv-id,
+    `mail.protonmail.ch`; Bridge serves those headers as Proton stored them.
+    The mail counts as from its address only when there is exactly one Proton
+    DMARC verdict, it is `pass`, and it names the `From:` domain. Proton strips
+    a sender-supplied `mail.protonmail.ch` header (checked on Bridge 3.27.0),
+    and one that slipped through would sit beside Proton's own and be refused
+    as two. A domain's DMARC policy doesn't matter: with `p=none` Proton still
+    delivers forged mail, but records `dmarc=fail`.
+  - *Mail from another Proton account.* This carries no DMARC verdict. Proton
+    marks it `X-Pm-Origin: internal`, and its `From:` comes from Proton's
+    record of the sending account, which can only send as its own addresses.
+    It counts as verified with exactly one `X-Pm-Origin`, `internal`, and no
+    Proton DMARC verdict. Proton strips a sender-supplied `X-Pm-Origin` from
+    outside mail and adds its own `external` (checked on Bridge 3.27.0), so a
+    forged `internal` would show as two values and be refused.
+
+  Either way the `From:` must be a single plain address (no quoted local part,
+  no second address). Mail from the Bridge account's own address is never
+  delivered. Refused mail is logged and left unread.
+- **What this does not prove.** DMARC vouches for a domain, not a mailbox: for
+  outside mail the adapter relies on the sender's own domain to stop its users
+  sending as each other, and any shared service in the domain's SPF record
+  widens who can send for it. That covers ordinary mail and `/` admin commands,
+  not only approvals, so the owner should write from a Proton address
+  (identified by mailbox) or from a domain with tight sending controls. Anyone
+  can open a free Proton account, and they are then verified as their *own*
+  address only; unknown senders still need your approval.
 - **Approvals.** Because of that, an approval needs more than a verified
   sender. Each card mail carries a random token in its subject; an answer counts
   only from the card's approver, quoting the token, sent `In-Reply-To` the card
@@ -297,7 +311,7 @@ What the adapter trusts, and why:
 
 - **type**: `proton-mail`
 - **terminology**: Email has correspondents, not chats or groups. Each sender address is its own conversation.
-- **platform-id-format**: the correspondent's address, lowercased, as-is — `someone@example.com`. Native adapter — no `proton-mail:` prefix. User ids are `proton-mail:someone@example.com`.
+- **platform-id-format**: the correspondent's address, lowercased, as-is — `someone@example.com`. Native adapter — no `proton-mail:` prefix. User ids are `proton-mail:someone@example.com`. When registering an address by hand (`/init-first-agent`, `ncl`), type it in lowercase: those store it as given, and a mixed-case row never matches the adapter's lowercased mail.
 - **how-to-find-id**: It's the sender's email address. Auto-discovered on first mail — check `pnpm exec tsx scripts/q.ts data/v2.db "SELECT platform_id, name FROM messaging_groups WHERE channel_type='proton-mail'"`.
 - **supports-threads**: no — one session per correspondent. Replies are threaded in the correspondent's mail client via `In-Reply-To`/`References`.
 - **typical-use**: Email in, email out. Forward a document for summary; email the agent a question; let it send scheduled reports.
@@ -305,13 +319,13 @@ What the adapter trusts, and why:
 
 ### Features
 
-- Inbound: body (quoted reply history stripped) then a `Subject:` line, attachments saved to the session inbox (up to 15 MB each), HTML-only mail flattened to text; a `/command` on the first line is a command
+- Inbound: body (quoted reply history stripped), then a `Subject:` line when the subject is new to the conversation; attachments saved to the session inbox (up to 15 MB each, 25 MB per mail) once the sender is approved; HTML-only mail flattened to text; a `/command` on the first line is a command
 - Outbound: plain-text replies, `Re:` subject, threaded onto the correspondent's last mail; file attachments from the session outbox
 - Approval questions — cards go out as their own mail with a `[NC-…]` reference in the subject and `/approve`-style commands; answer by replying to that mail with the command on the first line
 - Display cards (`send_card`) — sent as their plain-text version, with the card's links
 - Edits — email cannot change a sent mail, so an edit goes out as a follow-up on the edited mail's thread: an agent's edit as "Correction to my earlier message", the resolution of an approval card as an update to that card
-- Loop safety — the agent's own mail carries an `X-NanoClaw-Agent` header and is never re-ingested; `Auto-Submitted`, `Precedence: bulk/junk/list`, `List-Id`, `X-Autoreply`, null `Return-Path` bounces, delivery reports and `mailer-daemon`/`noreply` senders are dropped
-- Live delivery via IMAP IDLE, with a 60 s fallback poll; a mail whose handling fails is retried with back-off up to five times, then left unread and flagged `$NanoClawFailed`
+- Loop safety — mail from the Bridge account's own address is never ingested; more than 20 mails an hour from one sender are left unread, which stops two agents answering each other; inbound `Auto-Submitted`, `Precedence: bulk/junk/list`, `List-Id`, `X-Autoreply`, null `Return-Path` bounces, delivery reports and `mailer-daemon`/`noreply` senders are dropped. Bridge drops custom headers from outgoing mail, so the agent's mail cannot carry `Auto-Submitted` or a loop marker of its own
+- Live delivery via IMAP IDLE, with a 60 s fallback poll; no mail is read for the first 30 s after a start, while the host finishes starting; a mail whose handling fails in the adapter is retried with back-off up to five times, then left unread and flagged `$NanoClawFailed` (a routing failure inside the host is logged there and not retried)
 
 Not supported: reactions, typing indicators, deleting sent mail, groups/mailing-list semantics (a CC'd thread is still one conversation per sender).
 
@@ -331,7 +345,7 @@ PROTON_MAIL_SMTP_PORT=1025
 PROTON_MAIL_TLS_CA_FILE=store/proton-mail/bridge-cert.pem   # pin Bridge's certificate (verified on every connection)
 PROTON_MAIL_TLS_REJECT_UNAUTHORIZED=        # unset: verify except on loopback; true/false forces it (ignored when the CA file is set)
 PROTON_MAIL_MAILBOX=INBOX                   # folder to watch
-PROTON_MAIL_POLL_SECONDS=60                 # fallback poll behind IDLE; also when failed mail is retried
+PROTON_MAIL_POLL_SECONDS=60                 # fallback poll behind IDLE; also when failed mail is retried (10–3600)
 PROTON_MAIL_MARK_SEEN=true                  # mark handled mail read in Proton
 PROTON_MAIL_PROCESS_BACKLOG=false           # true: ingest all existing mail on first start
 PROTON_MAIL_DEFAULT_SUBJECT=Message from your assistant   # for agent-initiated mail with no thread
@@ -404,7 +418,7 @@ always re-exports the certificate) and restart.
 ### Mail arrives in Proton but the agent never wakes
 
 1. Adapter connected: `grep "Proton Mail adapter connected" logs/nanoclaw.log | tail -1`
-2. Sender verified: `grep "sender is unverified\|single sender" logs/nanoclaw.log | tail` — mail without a Proton DMARC pass for its `From:` domain is left unread on purpose (see **Security**).
+2. Sender verified: `grep "sender is unverified\|single sender\|hourly limit" logs/nanoclaw.log | tail` — mail without a Proton DMARC pass for its `From:` domain (or, from a Proton account, without `X-Pm-Origin: internal`), and mail past a sender's 20 an hour, is left unread on purpose (see **Security**).
 3. Sender wired or approved: `pnpm exec tsx scripts/q.ts data/v2.db "SELECT platform_id, unknown_sender_policy, denied_at FROM messaging_groups WHERE channel_type='proton-mail'"` — a first-time sender is held for approval; check `ncl approvals list`.
 4. Not filtered: the adapter drops `Auto-Submitted`, `Precedence: bulk/junk/list`, `List-Id`, null-`Return-Path` bounces and `noreply@`/`mailer-daemon@` senders (`logs/nanoclaw.log` at debug: `Proton Mail inbound skipped`).
 5. Handling failed: `grep "will retry\|giving up on a mail" logs/nanoclaw.log | tail` — a mail flagged `$NanoClawFailed` was tried five times and left unread.
@@ -417,7 +431,8 @@ always re-exports the certificate) and restart.
 and the sender gets a short mail saying why. The reply must be to the request
 email itself (not a new mail), keep its `[NC-…]` subject, and start with one of
 the listed commands. A request that was already answered, or expired, cannot be
-answered again.
+answered again. Gateway approvals expire after 120 s, which is short for email:
+an approver who answers by email may find the request gone.
 
 ### Replies not sending (`SMTP` errors in `logs/nanoclaw.error.log`)
 
