@@ -445,6 +445,13 @@ export interface CardRef {
   answeredAt?: string;
   /** Core closed the card without an answer from here (a gateway approval that timed out, say). */
   closedAt?: string;
+  /** Core's own words for why (its terminal edit's resolution, e.g. "⏱️ Timed out — no response"). */
+  closedReason?: string;
+}
+
+/** Why a closed card refuses a late reply: core's reason when it gave one. */
+export function closedCardReason(card: CardRef): string {
+  return card.closedReason ? `that request has closed: ${card.closedReason}` : 'that request is no longer waiting';
 }
 
 export type CardReplyMatch =
@@ -489,7 +496,7 @@ export function matchCardReply(input: {
   if (!card) return { kind: 'refused', reason: 'that request is no longer waiting', notify: knownApprover, token };
   if (card.address !== input.fromAddress) return { kind: 'refused', reason: 'not the approver', notify: false, token };
   if (card.answeredAt) return { kind: 'refused', reason: 'that request was already answered', notify: true, token };
-  if (card.closedAt) return { kind: 'refused', reason: 'that request is no longer waiting', notify: true, token };
+  if (card.closedAt) return { kind: 'refused', reason: closedCardReason(card), notify: true, token };
   if (input.inReplyTo !== card.messageId)
     return { kind: 'refused', reason: 'it is not a reply to the request email itself', notify: true, token };
   const option = matchCommandReply(input.body, card.options);
@@ -1337,9 +1344,15 @@ registerChannelAdapter('proton-mail', {
             const [token, card] = found;
             // Core's resolution (terminalCard) closes the card: a gateway
             // approval that timed out is gone from the host, so a later reply
-            // must be refused, not acknowledged.
+            // must be refused, not acknowledged — and the refusal says why,
+            // in core's own words.
             if (content.terminalCard && !card.answeredAt && !card.closedAt) {
-              state.cards[token] = { ...card, closedAt: new Date().toISOString() };
+              const resolution = (content.terminalCard as { resolution?: unknown }).resolution;
+              state.cards[token] = {
+                ...card,
+                closedAt: new Date().toISOString(),
+                ...(typeof resolution === 'string' && resolution.trim() && { closedReason: oneLine(resolution, 120) }),
+              };
               saveState(state);
             }
             return sendMail(platformId, text, [], {

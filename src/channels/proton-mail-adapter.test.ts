@@ -301,7 +301,7 @@ describe('approval card lifecycle', () => {
     return mail({ subject: `Re: [${token}] x`, body: '/approve', inReplyTo: id });
   };
 
-  it('a terminal edit (a timed-out gateway approval) closes the card; a later reply is refused', async () => {
+  it('a terminal edit (a timed-out gateway approval) closes the card; a later reply is refused, with core’s reason', async () => {
     h.render = { title: 'card', options: [], deferResolution: true };
     const { adapter, calls, arrive } = await start();
     const id = await adapter.deliver(OWNER, null, card('appr-T', 'Use the live key?'));
@@ -316,8 +316,22 @@ describe('approval card lifecycle', () => {
     });
     await arrive(approveReply(id));
     expect(calls.action).toHaveLength(0);
-    expect(h.sent.at(-1).text).toMatch(/not taken as an answer: that request is no longer waiting/);
+    // The closing mail itself carries core's text; the refusal of a late reply
+    // now says why too, instead of a bare "no longer waiting".
+    expect(h.sent[1].text).toBe('Use the live key?\n\n⏱️ Timed out — no response');
+    expect(h.sent.at(-1).text).toMatch(/not taken as an answer: that request has closed: ⏱️ Timed out — no response\./);
     expect(h.sent.map((m) => m.text).join('\n')).not.toMatch(/Reply received/);
+  });
+
+  it('a card closed without a reason keeps the plain refusal', async () => {
+    const { adapter, arrive } = await start();
+    const id = await adapter.deliver(OWNER, null, card('appr-U', 'Use the live key?'));
+    await adapter.deliver(OWNER, null, {
+      kind: 'chat-sdk',
+      content: { operation: 'edit', messageId: id, text: 'closed', terminalCard: {} },
+    });
+    await arrive(approveReply(id));
+    expect(h.sent.at(-1).text).toMatch(/not taken as an answer: that request is no longer waiting\./);
   });
 
   it('a reply to a card core no longer has is refused, not acknowledged as an outcome', async () => {
