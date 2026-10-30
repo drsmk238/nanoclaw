@@ -482,6 +482,18 @@ describe('review of #4218 (ultrareview)', () => {
     ]);
   });
 
+  it('a subject with an invisible character is kept plain: replies carry no mark, and a follow-up is just its body', async () => {
+    const { adapter, calls, arrive } = await start();
+    const encoded = (s: string) => `=?UTF-8?B?${Buffer.from(s).toString('base64')}?=`;
+    await arrive(mail({ subject: encoded('Hello\u200F'), body: 'first' }));
+    // The agent sees the subject marked.
+    expect(calls.inbound[0].content.text).toMatch(/\n\nSubject: Hello\[text-direction characters [0-9a-f]+\]$/);
+    await adapter.deliver(OWNER, null, { kind: 'chat', content: { text: 'Reply with the name for your new agent:' } });
+    expect(h.sent.at(-1).subject).toBe('Re: Hello\u200F');
+    await arrive(mail({ subject: encoded('Re: Hello\u200F'), body: 'Alice\n\nSent with Proton Mail secure email.' }));
+    expect(calls.inbound[1].content.text).toBe('Alice');
+  });
+
   it('the inbound id is the adapter’s own, so a reused Message-ID cannot collide', async () => {
     const { calls, arrive } = await start();
     const same = (body: string) =>
@@ -1087,6 +1099,22 @@ describe('header and identity hardening, through the whole adapter', () => {
       expect(names.some((n: string) => n.endsWith('.ics'))).toBe(true);
     });
 
+    it('two attachments with one name are saved under two names', async () => {
+      const { calls, arrive } = await start();
+      const png = (name: string) =>
+        part(
+          [
+            'Content-Type: image/png',
+            `Content-Disposition: attachment; filename=${name}`,
+            'Content-Transfer-Encoding: base64',
+          ],
+          b64(300),
+        );
+      await arrive(multipart([...png('image.png'), ...png('image.png'), ...png('.image.png')]));
+      const names = calls.inbound[0].content.attachments.map((x: { name: string }) => x.name);
+      expect(names).toEqual(['image.png', 'image-2.png', 'image-3.png']);
+    });
+
     it('an unapproved sender is not told an inline logo was held back', async () => {
       h.wired = false;
       const { calls, arrive } = await start();
@@ -1196,20 +1224,51 @@ describe('loops and the hourly limit (fake IMAP server, faked clock)', () => {
     expect(h.sent).toEqual([]);
   });
 
-  it('the 21st mail in an hour is left unread, unflagged and not revisited; the hour after, mail flows', async () => {
+  it('the 21st mail in an hour waits, unread and unflagged, and is handed over when the hour has room', async () => {
     const { calls } = await start();
     const twentyFirst = await arriveAll(Array.from({ length: 21 }, (_, i) => mail({ body: `reply ${i}` })));
     expect(calls.inbound).toHaveLength(20);
-    expect(readState()).toMatchObject({ lastUid: twentyFirst, retry: {} });
+    expect(readState()).toMatchObject({
+      lastUid: twentyFirst,
+      retry: { [twentyFirst]: { attempts: 0, deferred: 'sender', from: OWNER } },
+    });
     expect(flagged().filter(([u]) => u === twentyFirst)).toEqual([]);
-    // An hour on (the clock only: no timer runs), the sender has slots again.
-    vi.setSystemTime(Date.now() + 60 * 60_000 + 1_000);
+    // Still inside the hour: a poll leaves it waiting.
+    vi.setSystemTime(Date.now() + 30 * 60_000);
+    h.server.current!.emit('exists');
+    await tick();
+    expect(calls.inbound).toHaveLength(20);
+    // An hour on (the clock only: no timer runs), the sender has slots again:
+    // the waiting mail goes first, then the new one.
+    vi.setSystemTime(Date.now() + 30 * 60_000 + 1_000);
     const next = await arriveAll([mail({ body: 'an hour later' })]);
-    expect(calls.inbound.at(-1).content.text).toBe('an hour later');
-    expect(flagged().filter(([u]) => u === next)).toEqual([[next, ['\\Seen']]]);
-    // The refused mail is never fetched again.
-    expect(h.server.calls('fetchOne').filter((e) => e.args[0] === String(twentyFirst))).toHaveLength(1);
-    expect([...h.server.messages.get(twentyFirst)!.flags]).toEqual([]);
+    expect(calls.inbound.slice(-2).map((m) => m.content.text)).toEqual(['reply 20', 'an hour later']);
+    expect(flagged().filter(([u]) => u >= twentyFirst)).toEqual([
+      [twentyFirst, ['\\Seen']],
+      [next, ['\\Seen']],
+    ]);
+    expect(readState().retry).toEqual({});
+  }, 60_000);
+
+  it('new addresses not yet approved: ten an hour reach the host, the eleventh waits for the hour', async () => {
+    h.wired = false;
+    const { calls } = await start();
+    const last = await arriveAll(
+      Array.from({ length: 11 }, (_, i) => mail({ from: `stranger${i}@example.org`, body: `hello ${i}` })),
+    );
+    expect(calls.inbound).toHaveLength(10);
+    const state = readState();
+    expect(Object.keys(state.strangers)).toHaveLength(10);
+    expect(state.retry[last]).toMatchObject({ deferred: 'strangers', from: 'stranger10@example.org' });
+    expect(flagged().filter(([u]) => u === last)).toEqual([]);
+    // A second mail from an address already counted is not held.
+    await arriveAll([mail({ from: 'stranger0@example.org', body: 'again' })]);
+    expect(calls.inbound.at(-1).content.text).toBe('again');
+    // An hour on, the waiting one goes through.
+    vi.setSystemTime(Date.now() + 60 * 60_000 + 1_000);
+    await arriveAll([mail({ from: 'stranger1@example.org', body: 'later' })]);
+    expect(calls.inbound.slice(-2).map((m) => m.content.text)).toEqual(['hello 10', 'later']);
+    expect(readState().retry).toEqual({});
   }, 60_000);
 });
 

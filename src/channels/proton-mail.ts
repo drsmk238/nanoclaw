@@ -38,10 +38,11 @@ import nodemailer, { type Transporter } from 'nodemailer';
 
 import { extForMime } from '../attachment-naming.js';
 import { isSafeAttachmentName } from '../attachment-safety.js';
-import { STORE_DIR } from '../config.js';
+import { STORE_DIR, TIMEZONE } from '../config.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+import { formatLocalTime } from '../timezone.js';
 import type {
   ChannelAdapter,
   ChannelDefaults,
@@ -67,11 +68,28 @@ const CARDS_HARD_MAX = 1000;
 /** How long after setup() the first drain runs: see setup(). */
 const STARTUP_DELAY_MS = 30_000;
 /**
- * Mail taken from one sender per hour; beyond it, mail is left unread. Bridge
- * drops every loop marker on outgoing mail, so two agents answering each
- * other (or a responder that marks nothing) are stopped here.
+ * Mail taken from one sender per hour; beyond it, mail waits (in `retry`)
+ * until the hour has room again. Bridge drops every loop marker on outgoing
+ * mail, so two agents answering each other (or a responder that marks
+ * nothing) are slowed here.
  */
 const INBOUND_PER_SENDER_PER_HOUR = 20;
+const HOUR_MS = 60 * 60_000;
+/**
+ * Mail waiting for a limit's hour, per sender and in all. Past either, mail is
+ * left unread for good: a loop would otherwise queue without end.
+ */
+const DEFERRED_PER_SENDER_MAX = INBOUND_PER_SENDER_PER_HOUR;
+const DEFERRED_MAX = 200;
+/**
+ * Addresses not yet approved whose mail was handed to the host, each of which
+ * may raise an approval card that core never closes before CARD_TTL_MS. A new
+ * address over the hourly figure waits for the hour; over the total it is left
+ * unread and flagged. Both stay well under CARDS_HARD_MAX, so strangers alone
+ * can never fill the cards the owner's own approvals need.
+ */
+const STRANGERS_PER_HOUR = 10;
+const STRANGERS_MAX = 200;
 const FAILURES_LISTED_MAX = 20;
 const ADDRESSES_LISTED_MAX = 50;
 const CARD_TTL_MS = 7 * 24 * 60 * 60_000;
@@ -538,7 +556,7 @@ export async function forwardedMessageText(source: Uint8Array, token = newMarkTo
       head,
       // The attached mail's own From is its sender's claim, never checked.
       from?.address && `From (not verified): ${senderLabel(normalizeAddress(from.address), from.name)}`,
-      inner.date && `Date: ${inner.date.toUTCString()}`,
+      inner.date && `Date: ${formatLocalTime(inner.date.toISOString(), TIMEZONE)}`,
       inner.subject && `Subject: ${oneLine(inner.subject, SUBJECT_MAX_CHARS)}`,
     ].filter(Boolean);
     const text = (await mailText(inner, HTML_TIMEOUT_MS, { token })).slice(0, BODY_MAX_CHARS).trim();
@@ -710,10 +728,21 @@ function attributionAt(lines: string[], i: number): number {
 }
 
 /**
+ * A signature's first line: the RFC 3676 `-- ` delimiter (often sent without
+ * its space), or a footer a mail client adds by itself — Proton's on free
+ * accounts, the phone clients', Outlook's. Whole short lines only, so prose
+ * that starts "Sent from my office …" and goes on is not one.
+ */
+const SIGNATURE_START =
+  /^(--|Sent with Proton\s?Mail\b.{0,80}|Sent from (my\s.{1,40}|Outlook\b.{0,40}|Mail for Windows\b.{0,20}|Proton\s?Mail\b.{0,40})|Get Outlook for (iOS|Android)\b.{0,20})$/i;
+
+/**
  * Drop the quoted history a mail client appends to a reply: everything from
  * the "On … wrote:" / "-----Original Message-----" marker on, plus any trailing
- * `>`-quoted lines. Returns the original when stripping would leave nothing —
- * a message that is only a quote is still a message.
+ * `>`-quoted lines. A signature above the history goes too: core reads a
+ * reply's text as the exact answer to its free-text prompts. Returns the
+ * original when stripping would leave nothing — a message that is only a
+ * quote is still a message.
  */
 export function stripQuotedReply(text: string): string {
   const lines = text.replace(/\r\n/g, '\n').split('\n');
@@ -728,6 +757,7 @@ export function stripQuotedReply(text: string): string {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (
+      (line.length <= 120 && SIGNATURE_START.test(line)) ||
       attributionAt(lines, i) > 0 ||
       /^-{2,}\s*Original Message\s*-{2,}$/i.test(line) ||
       /^-{2,}\s*Forwarded message\s*-{2,}$/i.test(line) ||
@@ -761,6 +791,15 @@ export function subjectStem(subject: string | undefined): string {
   return s.toLowerCase();
 }
 
+/** Whether frameInbound shows the subject: it says something the thread has not. */
+export function subjectShown(
+  subject: string | undefined,
+  threadSubject: string | undefined,
+  plainSubject = subject,
+): boolean {
+  return !!subject && !CARD_TOKEN_RE.test(subject) && subjectStem(plainSubject) !== subjectStem(threadSubject);
+}
+
 /**
  * The agent's text for an inbound mail: the body first, so a slash command
  * on the first line of a mail stays a command, then the subject on a line of
@@ -768,16 +807,20 @@ export function subjectStem(subject: string | undefined): string {
  * conversation's subject, or a reply on a card's thread, is just its body:
  * core reads `text` as the exact answer to its free-text prompts (a new
  * agent's name, a reason for a rejection).
+ *
+ * `plainSubject` is what is compared with `threadSubject`, when `subject` (as
+ * shown) carries this mail's own marks.
  */
 export function frameInbound(
   subject: string | undefined,
   body: string,
   failures: string[] = [],
   threadSubject?: string,
+  plainSubject = subject,
 ): string {
   let text = body.trim();
-  const isNew = subject && !CARD_TOKEN_RE.test(subject) && subjectStem(subject) !== subjectStem(threadSubject);
-  if (isNew) text = text ? `${text}\n\nSubject: ${subject}` : `Subject: ${subject}`;
+  if (subjectShown(subject, threadSubject, plainSubject))
+    text = text ? `${text}\n\nSubject: ${subject}` : `Subject: ${subject}`;
   if (failures.length > 0) text += `\n\n[attachments not delivered: ${failures.join(', ')}]`;
   return text;
 }
@@ -960,6 +1003,27 @@ export function cleanAttachmentName(
   }
   if (!name || !isSafeAttachmentName(name)) return fallbackName;
   return name;
+}
+
+/**
+ * `name`, or `name-2`, `name-3` … (before the extension) when a name already
+ * taken in this mail is that, ignoring case. The host never overwrites a saved
+ * file, so a second `image.png` would otherwise not be saved at all. Records
+ * the result in `taken`.
+ */
+export function uniqueAttachmentName(name: string, taken: Set<string>): string {
+  const dot = name.lastIndexOf('.');
+  const tail = dot > 0 && name.length - dot <= 10 ? name.slice(dot) : '';
+  const base = tail ? name.slice(0, dot) : name;
+  let out = name;
+  for (let n = 2; taken.has(out.toLowerCase()); n++) {
+    const suffix = `-${n}${tail}`;
+    let b = base;
+    while (b && Buffer.byteLength(b + suffix, 'utf8') > NAME_MAX_BYTES) b = b.slice(0, -1);
+    out = b + suffix;
+  }
+  taken.add(out.toLowerCase());
+  return out;
 }
 
 /** Inline images under this size are signature logos and icons, not content. */
@@ -1252,6 +1316,13 @@ interface ThreadRef {
 interface RetryRef {
   attempts: number;
   nextAt: string;
+  /**
+   * Not a failure: the mail waits for an hourly limit's room — the sender's
+   * own, or the one on new addresses — and that limit is checked again.
+   */
+  deferred?: 'sender' | 'strangers';
+  /** The sender of a deferred mail, for DEFERRED_PER_SENDER_MAX. */
+  from?: string;
 }
 
 interface AdapterState {
@@ -1260,8 +1331,13 @@ interface AdapterState {
   threads: Record<string, ThreadRef>;
   /** Cards by token; kept after an answer (answeredAt) so core's resolution edit threads onto them. */
   cards: Record<string, CardRef>;
-  /** UIDs whose handling threw, waiting for another attempt. */
+  /** UIDs whose handling threw, or that wait for an hourly limit, due another attempt. */
   retry: Record<string, RetryRef>;
+  /**
+   * Addresses not yet approved whose mail went to the host, with when it first
+   * did; kept for CARD_TTL_MS (see STRANGERS_MAX).
+   */
+  strangers: Record<string, string>;
 }
 
 /** The state as last saved before the current file; what loadState falls back to. */
@@ -1279,6 +1355,7 @@ function readStateFile(file: string): AdapterState {
     threads: raw.threads ?? {},
     cards: raw.cards ?? {},
     retry: raw.retry ?? {},
+    strangers: raw.strangers ?? {},
   };
 }
 
@@ -1291,11 +1368,14 @@ function readStateFile(file: string): AdapterState {
 export function loadState(): AdapterState {
   if (!fs.existsSync(STATE_FILE) && !fs.existsSync(STATE_BACKUP)) {
     log.debug('No Proton Mail adapter state yet, starting fresh');
-    return { threads: {}, cards: {}, retry: {} };
+    return { threads: {}, cards: {}, retry: {}, strangers: {} };
   }
   try {
-    return readStateFile(STATE_FILE);
+    const state = readStateFile(STATE_FILE);
+    stateFileGood = true;
+    return state;
   } catch (err) {
+    stateFileGood = false;
     try {
       const state = readStateFile(STATE_BACKUP);
       log.warn('Proton Mail: state file unreadable — carried on from its backup', { file: STATE_FILE, err });
@@ -1307,9 +1387,16 @@ export function loadState(): AdapterState {
 }
 
 /**
+ * Whether the state file is known to be readable: this process read it or
+ * wrote it last. Saves then rotate it into the backup without parsing it again.
+ */
+let stateFileGood = false;
+
+/**
  * Atomic and owner-only: a torn write would reset the cursor and skip mail.
  * The file being replaced is kept as the backup first, so one bad file never
- * loses the state.
+ * loses the state. Between the two renames there is no state file, and
+ * loadState reads the backup.
  */
 export function saveState(state: AdapterState): void {
   try {
@@ -1318,14 +1405,15 @@ export function saveState(state: AdapterState): void {
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
     if (fs.existsSync(STATE_FILE)) {
       try {
-        readStateFile(STATE_FILE);
-        fs.copyFileSync(STATE_FILE, STATE_BACKUP);
+        if (!stateFileGood) readStateFile(STATE_FILE);
+        fs.renameSync(STATE_FILE, STATE_BACKUP);
         fs.chmodSync(STATE_BACKUP, 0o600);
       } catch {
         // The current file is the bad one: keep the backup that is good.
       }
     }
     fs.renameSync(tmp, STATE_FILE);
+    stateFileGood = true;
   } catch (err) {
     log.error('Failed to persist Proton Mail adapter state', { err });
   }
@@ -1597,19 +1685,76 @@ registerChannelAdapter('proton-mail', {
     /** Recent mail times per sender, for INBOUND_PER_SENDER_PER_HOUR; in memory only. */
     const recentBySender = new Map<string, number[]>();
 
-    function withinSenderRate(addr: string, now = Date.now()): boolean {
-      const recent = (recentBySender.get(addr) ?? []).filter((t) => now - t < 60 * 60_000);
-      if (recent.length >= INBOUND_PER_SENDER_PER_HOUR) {
-        recentBySender.set(addr, recent);
-        return false;
-      }
-      recent.push(now);
+    /** Null when this mail fits the sender's hour (and is counted); else when the hour has room again. */
+    function senderRateFreeAt(addr: string, now = Date.now()): number | null {
+      const recent = (recentBySender.get(addr) ?? []).filter((t) => now - t < HOUR_MS);
       recentBySender.set(addr, recent);
-      return true;
+      if (recent.length >= INBOUND_PER_SENDER_PER_HOUR) return Math.min(...recent) + HOUR_MS;
+      recent.push(now);
+      return null;
     }
 
-    /** 'done': handled (or deliberately dropped); 'leave-unread': refused, for a human to look at. */
-    type Outcome = 'done' | 'leave-unread';
+    /**
+     * 'done': handled (or deliberately dropped); 'leave-unread': refused, for a
+     * human to look at; 'deferred': waiting in `retry` for an hourly limit.
+     */
+    type Outcome = 'done' | 'leave-unread' | 'deferred';
+
+    /**
+     * Hold a mail in `retry` until `at`, when its limit has room again — unless
+     * too much mail already waits, when it is left unread for good.
+     */
+    function defer(uid: number, kind: 'sender' | 'strangers', from: string, at: number): Outcome {
+      if (!state.retry[uid]?.deferred) {
+        const waiting = Object.values(state.retry).filter((r) => r.deferred);
+        if (
+          waiting.length >= DEFERRED_MAX ||
+          waiting.filter((r) => r.from === from).length >= DEFERRED_PER_SENDER_MAX
+        ) {
+          log.warn('Proton Mail: over an hourly limit with too much mail already waiting — left unread', {
+            uid,
+            from,
+            limit: kind,
+          });
+          return 'leave-unread';
+        }
+      }
+      state.retry[uid] = { attempts: 0, nextAt: new Date(at).toISOString(), deferred: kind, from };
+      log.warn('Proton Mail: over an hourly limit — mail held until the hour has room', {
+        uid,
+        from,
+        limit: kind,
+        until: state.retry[uid].nextAt,
+      });
+      return 'deferred';
+    }
+
+    /**
+     * Whether a mail from an address not yet approved may go to the host now
+     * (see STRANGERS_MAX): 'ok' records the address, or the outcome otherwise.
+     */
+    async function admitStranger(uid: number, addr: string): Promise<'ok' | Outcome> {
+      const now = Date.now();
+      for (const [a, at] of Object.entries(state.strangers)) {
+        if (now - Date.parse(at) > CARD_TTL_MS) delete state.strangers[a];
+      }
+      if (state.strangers[addr]) return 'ok';
+      const times = Object.values(state.strangers).map((t) => Date.parse(t));
+      if (times.length >= STRANGERS_MAX) {
+        log.warn('Proton Mail: too many new addresses awaiting approval — left unread and flagged', {
+          uid,
+          from: addr,
+          max: STRANGERS_MAX,
+          keyword: FAILED_KEYWORD,
+        });
+        await flag(uid, [FAILED_KEYWORD]);
+        return 'leave-unread';
+      }
+      const lastHour = times.filter((t) => now - t < HOUR_MS);
+      if (lastHour.length >= STRANGERS_PER_HOUR) return defer(uid, 'strangers', addr, Math.min(...lastHour) + HOUR_MS);
+      state.strangers[addr] = new Date(now).toISOString();
+      return 'ok';
+    }
 
     async function handleMessage(
       uid: number,
@@ -1681,15 +1826,13 @@ registerChannelAdapter('proton-mail', {
         return 'leave-unread';
       }
 
-      // A retry was counted when it first came in; counting it again would let
-      // one failing mail use up the sender's hour.
-      if (!state.retry[uid] && !withinSenderRate(fromAddr)) {
-        log.warn('Proton Mail: sender over the hourly limit — left unread (a mail loop?)', {
-          uid,
-          from: fromAddr,
-          perHour: INBOUND_PER_SENDER_PER_HOUR,
-        });
-        return 'leave-unread';
+      // A failed mail's retry was counted when it first came in; counting it
+      // again would let one failing mail use up the sender's hour. A mail
+      // held for this limit is checked again.
+      const retry = state.retry[uid];
+      if (!retry || retry.deferred === 'sender') {
+        const freeAt = senderRateFreeAt(fromAddr);
+        if (freeAt !== null) return defer(uid, 'sender', fromAddr, freeAt);
       }
 
       // Through every check: now the whole mail.
@@ -1700,11 +1843,11 @@ registerChannelAdapter('proton-mail', {
       const fullText = await mailText(parsed, HTML_TIMEOUT_MS, { retryable: !state.retry[uid], token });
       const rawText = fullText.slice(0, TEXT_MAX_CHARS);
       // Subject, Message-ID and References come from any sender and are kept
-      // in the state file and sent back in headers, so each is capped.
-      const subjectShown = parsed.subject
-        ? flagInvisibleText(oneLine(parsed.subject, SUBJECT_MAX_CHARS), token)
-        : undefined;
-      const subject = subjectShown?.text || undefined;
+      // in the state file and sent back in headers, so each is capped. What
+      // is kept and sent back is the plain subject; the agent sees it marked.
+      const subjectPlain = parsed.subject ? oneLine(parsed.subject, SUBJECT_MAX_CHARS) || undefined : undefined;
+      const subjectMarks = subjectPlain ? flagInvisibleText(subjectPlain, token) : undefined;
+      const subject = subjectMarks?.text || undefined;
       let body = stripQuotedReply(rawText);
       // A mail forwarded as an attachment ("Forward as Attachment") carries
       // its whole content in a message/rfc822 part: read its text into the
@@ -1716,10 +1859,6 @@ registerChannelAdapter('proton-mail', {
       if (body.length > BODY_MAX_CHARS) {
         body = body.slice(0, BODY_MAX_CHARS) + `\n\n[… truncated, ${fullText.length} characters in total]`;
       }
-      const shown = flagInvisibleText(body, token);
-      body = shown.text;
-      if (shown.flagged || subjectShown?.flagged || body.includes(`[hidden ${token}: `))
-        body += `\n\n${hiddenNote(token)}`;
       const senderName = senderLabel(fromAddr, sender.name);
       // Message-ID threads replies; it is the sender's to choose, so it is
       // never the inbound id (see `id` below).
@@ -1729,6 +1868,11 @@ registerChannelAdapter('proton-mail', {
       // not against its own subject, which rememberThread has since stored.
       const prior = state.threads[fromAddr];
       const threadSubject = prior?.messageId === messageId ? prior.framedAgainst : prior?.subject;
+      const shown = flagInvisibleText(body, token);
+      body = shown.text;
+      // The subject's marks count only when the agent sees the subject.
+      const subjectMarked = !!subjectMarks?.flagged && subjectShown(subject, threadSubject, subjectPlain);
+      if (shown.flagged || subjectMarked || body.includes(`[hidden ${token}: `)) body += `\n\n${hiddenNote(token)}`;
       const references = [parsed.references ?? []]
         .flat()
         .map((r) => safeMessageId(r))
@@ -1753,7 +1897,7 @@ registerChannelAdapter('proton-mail', {
           await sendNotice(
             fromAddr,
             `That reply was not taken as an answer: ${reason}.\n\nTo answer, reply to the request email itself, keeping its subject, with the command on the first line.`,
-            replySubject(subject),
+            replySubject(subjectPlain),
             messageId,
           );
         }
@@ -1803,13 +1947,23 @@ registerChannelAdapter('proton-mail', {
       }
       if (match.kind === 'refused') return refuse(match.reason, match.notify);
 
+      // An address not yet approved raises a card core keeps open for days:
+      // new addresses are limited, so strangers cannot fill the cards the
+      // owner's approvals need. An approver answering on a card's thread is
+      // not a stranger.
+      const approved = await senderApproved(fromAddr);
+      if (!approved && !Object.values(state.cards).some((c) => c.address === fromAddr)) {
+        const admitted = await admitStranger(uid, fromAddr);
+        if (admitted !== 'ok') return admitted;
+      }
+
       // A mail on a card's thread (a reason after "Reject with reason…", say)
       // goes to the agent but does not become the conversation thread.
       if (!CARD_TOKEN_RE.test(subject ?? '')) {
         rememberThread(state, fromAddr, {
           messageId,
           references: [...references, messageId],
-          subject,
+          subject: subjectPlain,
           name: displayName(fromAddr, sender.name),
           ...(threadSubject !== undefined && { framedAgainst: threadSubject }),
         });
@@ -1820,7 +1974,7 @@ registerChannelAdapter('proton-mail', {
       // should not be able to park 40 MB there per new address.
       const attachments: Array<{ type: string; name: string; data: string; mimeType?: string }> = [];
       const failures: string[] = [];
-      const approved = parsed.attachments.length > 0 && (await senderApproved(fromAddr));
+      const takenNames = new Set<string>();
       let totalBytes = 0;
       let unlisted = 0;
       // Filenames are the sender's too: each is cut short, and only so many listed.
@@ -1854,7 +2008,7 @@ registerChannelAdapter('proton-mail', {
         totalBytes += att.size;
         const fallback = `${type}-${uid}-${attachments.length + 1}`;
         const rawName = att.filename ?? '';
-        const name = cleanAttachmentName(rawName, att.contentType, fallback);
+        const name = uniqueAttachmentName(cleanAttachmentName(rawName, att.contentType, fallback), takenNames);
         if (rawName && name !== rawName) {
           log.warn('Attachment filename changed — unsafe or misleading', { rawName, replacement: name });
         }
@@ -1864,9 +2018,12 @@ registerChannelAdapter('proton-mail', {
 
       if (unlisted > 0) failures.push(`and ${unlisted} more`);
 
-      const text = frameInbound(subject, body, failures, threadSubject);
+      const text = frameInbound(subject, body, failures, threadSubject, subjectPlain);
       saveState(state);
       if (!text.trim() && attachments.length === 0) return 'done';
+      // Teardown has begun: a mail handed over now would be marked read while
+      // its routing waited in memory, and lost at exit. It is retried instead.
+      if (shuttingDown) throw new Error('adapter shutting down');
 
       setupConfig.onMetadata(fromAddr, senderName, false);
 
@@ -1952,7 +2109,7 @@ registerChannelAdapter('proton-mail', {
               throw new Error(client?.mailbox ? 'mail gone before its body was fetched' : 'mailbox not open');
             };
             outcome = await handleMessage(uid, msg.headers, fetchSource, date);
-            delete state.retry[uid];
+            if (outcome !== 'deferred') delete state.retry[uid];
           }
         }
       } catch (err) {
@@ -1972,7 +2129,7 @@ registerChannelAdapter('proton-mail', {
         }
       }
       // The cursor moves on either way, so one bad mail never holds up the
-      // rest; a failed one waits in `retry`. Retries cover what fails here —
+      // rest; a failed or deferred one waits in `retry`. Retries cover what fails here —
       // fetching, parsing, the card lookup, sending a refusal notice. Routing
       // runs inside the host after the hand-over, so a routing failure there
       // is not retried: the mail is already marked read.
@@ -2020,10 +2177,10 @@ registerChannelAdapter('proton-mail', {
             if (client.mailbox) for (const uid of due) if (!seen.has(uid)) delete state.retry[uid];
           }
           for (const uid of [...found.keys()].sort((a, b) => a - b)) {
-            if (!client || !connected) break;
+            if (!client || !connected || shuttingDown) break;
             await processUid(uid, found.get(uid));
           }
-        } while (drainAgain && client && connected);
+        } while (drainAgain && client && connected && !shuttingDown);
       } catch (err) {
         log.error('Proton Mail fetch failed', { err });
       } finally {
@@ -2063,9 +2220,22 @@ registerChannelAdapter('proton-mail', {
       });
       imap.on('exists', () => void drain());
 
+      // Teardown may run while this waits on the server: the new session is
+      // then closed here, never adopted.
+      const abandon = async (): Promise<boolean> => {
+        if (!shuttingDown) return false;
+        try {
+          await imap.logout();
+        } catch (err) {
+          log.debug('IMAP logout of a connect overtaken by teardown threw', { err });
+        }
+        return true;
+      };
       try {
         await imap.connect();
+        if (await abandon()) return;
         await imap.mailboxOpen(cfg.mailbox);
+        if (await abandon()) return;
         client = imap;
 
         const mailbox = imap.mailbox;

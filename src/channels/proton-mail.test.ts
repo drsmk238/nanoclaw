@@ -6,6 +6,9 @@
 import { describe, it, expect } from 'vitest';
 import { simpleParser } from 'mailparser';
 
+import { TIMEZONE } from '../config.js';
+import { formatLocalTime } from '../timezone.js';
+
 import {
   cardSubject,
   checkSenderAuth,
@@ -34,6 +37,7 @@ import {
   shouldSkipInbound,
   mailingListOf,
   stripQuotedReply,
+  uniqueAttachmentName,
   mailText,
   cleanAttachmentName,
   forwardedMessageText,
@@ -220,6 +224,8 @@ describe('forwardedMessageText', () => {
     expect(text).toContain('From (not verified): Sam Example <sam@example.org>');
     expect(text).toContain('Subject: Agenda');
     expect(text).toContain('Item three moves to next week.');
+    // In the install's timezone, as every time the agent sees.
+    expect(text).toContain(`Date: ${formatLocalTime('2026-10-28T15:04:07.000Z', TIMEZONE)}`);
   });
 });
 
@@ -442,6 +448,43 @@ describe('stripQuotedReply', () => {
   it('keeps a message that is only a quote', () => {
     expect(stripQuotedReply('> just forwarding this\n> as is')).toBe('> just forwarding this\n> as is');
   });
+  it('cuts a signature above the history: a "-- " block, Proton’s footer, a phone’s, Outlook’s', () => {
+    const attr = 'On Mon, 26 Oct 2026 at 10:00, Agent <a@x.com> wrote:\n> Name?';
+    expect(stripQuotedReply(`Alice\n\n-- \nAlice Example\nHead of Department\n\n${attr}`)).toBe('Alice');
+    expect(stripQuotedReply(`Alice\n\n--\nA. E.`)).toBe('Alice');
+    expect(stripQuotedReply(`Alice\n\nSent with Proton Mail secure email.\n\n${attr}`)).toBe('Alice');
+    expect(stripQuotedReply('Alice\n\nSent with Proton Mail [https://proton.me/mail/home] secure email.')).toBe(
+      'Alice',
+    );
+    expect(stripQuotedReply(`Alice\n\nSent from my iPhone\n\n${attr}`)).toBe('Alice');
+    expect(stripQuotedReply('Alice\n\nGet Outlook for iOS')).toBe('Alice');
+  });
+  it('keeps prose that only starts like a footer', () => {
+    const text = 'Sent from my office the forms you asked for, and the rest will follow by the end of the week.';
+    expect(stripQuotedReply(text)).toBe(text);
+  });
+  it('keeps a message that is only a signature', () => {
+    expect(stripQuotedReply('Sent from my iPhone')).toBe('Sent from my iPhone');
+  });
+});
+
+describe('uniqueAttachmentName', () => {
+  it('numbers a name already taken in the mail, before the extension, ignoring case', () => {
+    const taken = new Set<string>();
+    expect(uniqueAttachmentName('image.png', taken)).toBe('image.png');
+    expect(uniqueAttachmentName('image.png', taken)).toBe('image-2.png');
+    expect(uniqueAttachmentName('IMAGE.png', taken)).toBe('IMAGE-3.png');
+    expect(uniqueAttachmentName('notes', taken)).toBe('notes');
+    expect(uniqueAttachmentName('notes', taken)).toBe('notes-2');
+  });
+  it('stays within 255 bytes', () => {
+    const long = `${'é'.repeat(123)}x.pdf`; // 252 bytes
+    const taken = new Set<string>();
+    uniqueAttachmentName(long, taken);
+    const second = uniqueAttachmentName(long, taken);
+    expect(second.endsWith('-2.pdf')).toBe(true);
+    expect(Buffer.byteLength(second, 'utf8')).toBeLessThanOrEqual(255);
+  });
 });
 
 describe('header caps', () => {
@@ -575,6 +618,9 @@ describe('frameInbound', () => {
     expect(frameInbound('Re: Hello', 'Alice', [], 'Hello')).toBe('Alice');
     expect(frameInbound('Re: [NC-ABCDEFGHIJKLM] Deploy?', 'too risky', [], 'Hello')).toBe('too risky');
     expect(frameInbound('Re: Other', 'hi', [], 'Hello')).toBe('hi\n\nSubject: Re: Other');
+  });
+  it('compares the plain subject when the one shown carries this mail’s marks', () => {
+    expect(frameInbound('Re: Hello [marked]', 'Alice', [], 'Hello\u200E', 'Re: Hello\u200E')).toBe('Alice');
   });
   it('puts the body first so a slash command stays a command', () => {
     expect(frameInbound('admin', '/clear')).toBe('/clear\n\nSubject: admin');
