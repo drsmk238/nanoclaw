@@ -1240,6 +1240,12 @@ interface ThreadRef {
   references: string[];
   subject?: string;
   name?: string;
+  /**
+   * The thread subject this mail was framed against when it first came in.
+   * A mail handed over again (after a stop before its cursor was saved) is
+   * framed the same way, not against its own subject.
+   */
+  framedAgainst?: string;
   at: string;
 }
 
@@ -1258,28 +1264,67 @@ interface AdapterState {
   retry: Record<string, RetryRef>;
 }
 
-function loadState(): AdapterState {
-  try {
-    const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf-8')) as Partial<AdapterState>;
-    return {
-      uidValidity: raw.uidValidity,
-      lastUid: raw.lastUid,
-      threads: raw.threads ?? {},
-      cards: raw.cards ?? {},
-      retry: raw.retry ?? {},
-    };
-  } catch (err) {
-    log.debug('No Proton Mail adapter state yet, starting fresh', { err });
+/** The state as last saved before the current file; what loadState falls back to. */
+const STATE_BACKUP = `${STATE_FILE}.bak`;
+
+/** The state file could not be read and neither could its backup: refuse to start, never reset. */
+export class StateUnreadableError extends Error {}
+
+function readStateFile(file: string): AdapterState {
+  const raw = JSON.parse(fs.readFileSync(file, 'utf-8')) as Partial<AdapterState>;
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('not an object');
+  return {
+    uidValidity: raw.uidValidity,
+    lastUid: raw.lastUid,
+    threads: raw.threads ?? {},
+    cards: raw.cards ?? {},
+    retry: raw.retry ?? {},
+  };
+}
+
+/**
+ * The adapter's state. No file yet is a first start. A file that cannot be
+ * read falls back to the backup saved beside it; when that fails too the
+ * adapter refuses to start — a fresh state would move the cursor past mail
+ * that came in meanwhile and forget every waiting card, silently.
+ */
+export function loadState(): AdapterState {
+  if (!fs.existsSync(STATE_FILE) && !fs.existsSync(STATE_BACKUP)) {
+    log.debug('No Proton Mail adapter state yet, starting fresh');
     return { threads: {}, cards: {}, retry: {} };
+  }
+  try {
+    return readStateFile(STATE_FILE);
+  } catch (err) {
+    try {
+      const state = readStateFile(STATE_BACKUP);
+      log.warn('Proton Mail: state file unreadable — carried on from its backup', { file: STATE_FILE, err });
+      return state;
+    } catch {
+      throw new StateUnreadableError(`${STATE_FILE} and its backup cannot be read`);
+    }
   }
 }
 
-/** Atomic and owner-only: a torn write would reset the cursor and skip mail. */
-function saveState(state: AdapterState): void {
+/**
+ * Atomic and owner-only: a torn write would reset the cursor and skip mail.
+ * The file being replaced is kept as the backup first, so one bad file never
+ * loses the state.
+ */
+export function saveState(state: AdapterState): void {
   try {
     fs.mkdirSync(STATE_DIR, { recursive: true });
     const tmp = `${STATE_FILE}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    if (fs.existsSync(STATE_FILE)) {
+      try {
+        readStateFile(STATE_FILE);
+        fs.copyFileSync(STATE_FILE, STATE_BACKUP);
+        fs.chmodSync(STATE_BACKUP, 0o600);
+      } catch {
+        // The current file is the bad one: keep the backup that is good.
+      }
+    }
     fs.renameSync(tmp, STATE_FILE);
   } catch (err) {
     log.error('Failed to persist Proton Mail adapter state', { err });
@@ -1444,7 +1489,15 @@ registerChannelAdapter('proton-mail', {
       }
     }
 
-    const state = loadState();
+    let state: AdapterState;
+    try {
+      state = loadState();
+    } catch (err) {
+      log.error('Proton Mail: state and its backup are unreadable — adapter not started, so no mail is skipped', {
+        err,
+      });
+      return null;
+    }
     pruneCards(state);
     let setupConfig: ChannelSetup;
     let client: ImapFlow | undefined;
@@ -1671,7 +1724,11 @@ registerChannelAdapter('proton-mail', {
       // Message-ID threads replies; it is the sender's to choose, so it is
       // never the inbound id (see `id` below).
       const messageId = safeMessageId(parsed.messageId) ?? `<mail-${state.uidValidity ?? 0}-${uid}@nanoclaw.local>`;
-      const threadSubject = state.threads[fromAddr]?.subject;
+      // A mail handed over again (the host stopped before its cursor was
+      // saved) is framed against what it was framed against the first time,
+      // not against its own subject, which rememberThread has since stored.
+      const prior = state.threads[fromAddr];
+      const threadSubject = prior?.messageId === messageId ? prior.framedAgainst : prior?.subject;
       const references = [parsed.references ?? []]
         .flat()
         .map((r) => safeMessageId(r))
@@ -1754,6 +1811,7 @@ registerChannelAdapter('proton-mail', {
           references: [...references, messageId],
           subject,
           name: displayName(fromAddr, sender.name),
+          ...(threadSubject !== undefined && { framedAgainst: threadSubject }),
         });
       }
 

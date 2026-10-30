@@ -963,6 +963,17 @@ describe('IMAP cursor, restarts and UIDVALIDITY (fake IMAP server)', () => {
     expect(flagged()).toEqual([[1, ['\\Seen']]]);
     expect(readState().lastUid).toBe(1);
   });
+
+  it('the redelivered mail reads the same as the first delivery', async () => {
+    h.hangInbound = true;
+    const first = await start();
+    await first.arrive(mail({ subject: 'Rota', body: 'who is on duty?' }));
+    await first.adapter.teardown();
+    h.hangInbound = false;
+    vi.resetModules();
+    const second = await start();
+    expect(second.calls.inbound[0].content.text).toBe(first.calls.inbound[0].content.text);
+  });
 });
 
 describe('header and identity hardening, through the whole adapter', () => {
@@ -1001,6 +1012,26 @@ describe('header and identity hardening, through the whole adapter', () => {
     );
     expect(calls.action).toHaveLength(1);
     expect(h.sent).toHaveLength(sentBefore);
+  });
+
+  it('an unreadable state file falls back to its backup; both unreadable, the adapter does not start', async () => {
+    const first = await start();
+    await first.arrive(mail({ body: 'one' }));
+    await first.arrive(mail({ body: 'two' }));
+    await first.adapter.teardown();
+    expect(fs.existsSync(`${STATE}.bak`)).toBe(true);
+    const lastUid = readState().lastUid;
+    fs.writeFileSync(STATE, '{ torn');
+    vi.resetModules();
+    const second = await start();
+    // The backup is one save behind at most: the cursor never resets to zero.
+    expect(readState().lastUid).toBeGreaterThanOrEqual(lastUid - 1);
+    await second.adapter.teardown();
+    fs.writeFileSync(STATE, '{ torn');
+    fs.writeFileSync(`${STATE}.bak`, 'also torn');
+    vi.resetModules();
+    await import('./proton-mail.js');
+    expect(h.reg.factory()).toBeNull();
   });
 
   describe('attachments', () => {
@@ -1237,6 +1268,54 @@ describe('card answers', () => {
   });
 });
 
+describe('state backup', () => {
+  it('with the state file torn, the backup is what runs: mail and a waiting card from it are handled, the cursor exactly the backup’s', async () => {
+    const first = await start();
+    await first.arrive(mail({ body: 'one' }));
+    const id = await first.adapter.deliver(OWNER, null, card('appr-bak', 'Install jq?'));
+    const subject = h.sent[0].subject as string;
+    await first.adapter.teardown();
+    // While the adapter is down: its last good state is the backup, the state
+    // file is torn, and mail comes in — a new one, and the answer to the card.
+    fs.copyFileSync(STATE, `${STATE}.bak`);
+    const bak = JSON.parse(fs.readFileSync(`${STATE}.bak`, 'utf8'));
+    expect(bak.lastUid).toBe(1);
+    expect(Object.keys(bak.cards)).toEqual([tokenOf(subject)]);
+    fs.writeFileSync(STATE, '{ torn');
+    h.server.deliver(mail({ body: 'while down' }));
+    h.server.deliver(mail({ subject: `Re: ${subject}`, body: '/approve', inReplyTo: id }));
+    vi.resetModules();
+    const second = await start();
+    await drainedTo(3);
+    // The listing starts right after the backup's cursor: not at 0, not at the top.
+    const listed = h.server.calls('fetch').filter((e) => e.client === h.server.current!.id);
+    expect(listed[0].args[0]).toBe(`${bak.lastUid + 1}:*`);
+    expect(second.calls.inbound.map((m) => m.content.text)).toEqual(['while down']);
+    expect(second.calls.action.map((a) => a.slice(0, 2))).toEqual([['appr-bak', 'approve']]);
+    expect(readState()).toMatchObject({ uidValidity: bak.uidValidity, lastUid: 3 });
+  });
+
+  it('a save while the state file is torn keeps the good backup; a save over a good file rotates it into the backup', async () => {
+    const first = await start();
+    await first.arrive(mail({ body: 'one' }));
+    await first.adapter.teardown();
+    fs.copyFileSync(STATE, `${STATE}.bak`);
+    const good = fs.readFileSync(`${STATE}.bak`, 'utf8');
+    fs.writeFileSync(STATE, '{ torn');
+    vi.resetModules();
+    const { loadState, saveState } = await import('./proton-mail.js');
+    const state = loadState();
+    expect(state.lastUid).toBe(1);
+    saveState({ ...state, lastUid: 7 });
+    expect(fs.readFileSync(`${STATE}.bak`, 'utf8')).toBe(good);
+    expect(readState().lastUid).toBe(7);
+    const seven = fs.readFileSync(STATE, 'utf8');
+    saveState({ ...state, lastUid: 8 });
+    expect(fs.readFileSync(`${STATE}.bak`, 'utf8')).toBe(seven);
+    expect(readState().lastUid).toBe(8);
+  });
+});
+
 describe('an answer whose In-Reply-To carries a comment', () => {
   it('is taken', async () => {
     const { adapter, calls, arrive } = await start();
@@ -1348,6 +1427,25 @@ describe('wiring the unit tests cannot see', () => {
       ),
     );
     expect(calls.inbound[0].content.attachments.map((a: { name: string }) => a.name)).toEqual(['invoicefdp.exe']);
+  });
+
+  it('a redelivered reply that kept the conversation subject still leaves it out', async () => {
+    const first = await start();
+    await first.arrive(mail({ subject: 'Rota', body: 'who is on duty?' }));
+    h.hangInbound = true;
+    await first.arrive(mail({ subject: 'Re: Rota', body: 'and on Sunday?' }));
+    expect(first.calls.inbound.map((m) => m.content.text)).toEqual([
+      'who is on duty?\n\nSubject: Rota',
+      'and on Sunday?',
+    ]);
+    expect(readState().lastUid).toBe(1);
+    await first.adapter.teardown();
+    h.hangInbound = false;
+    vi.resetModules();
+    const second = await start();
+    expect(second.calls.inbound.map((m) => [m.id, m.content.text])).toEqual([
+      [first.calls.inbound[1].id, 'and on Sunday?'],
+    ]);
   });
 });
 
