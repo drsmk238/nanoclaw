@@ -345,6 +345,43 @@ describe('stripQuotedReply', () => {
     const text = 'From: my point of view this is fine.\nLet me know.';
     expect(stripQuotedReply(text)).toBe(text);
   });
+  it('keeps prose that merely starts with From: and To: lines', () => {
+    const text = 'Please note:\nFrom: the committee\nTo: all staff, this matters.';
+    expect(stripQuotedReply(text)).toBe(text);
+  });
+  it('still cuts an Outlook block with Sent:', () => {
+    expect(stripQuotedReply('Fine.\n\nFrom: A <a@x.com>\nSent: Monday\nTo: me\n\nold')).toBe('Fine.');
+  });
+  it('cuts Gmail’s attribution wrapped over two lines', () => {
+    const text = 'Agreed.\n\nOn Mon, 26 Oct 2026 at 10:00, Sam Example <\nsam@example.org> wrote:\n> earlier';
+    expect(stripQuotedReply(text)).toBe('Agreed.');
+  });
+  it('does not cut prose that starts "On" and ends a later line "wrote:"', () => {
+    const text = 'On reflection I agree\nwith what Sam wrote:\nthe trip should go ahead.';
+    expect(stripQuotedReply(text)).toBe(text);
+  });
+  it('stays linear on a long line that looks like the start of an attribution', () => {
+    for (const lead of ['Am schrieb', 'Op schreef', 'On wrote', 'Le a écrit']) {
+      const t0 = performance.now();
+      stripQuotedReply(`${lead}${' '.repeat(200_000)}x\nmore`);
+      expect(performance.now() - t0).toBeLessThan(200);
+    }
+  });
+  it('does not take a stray < for the address of a wrapped attribution', () => {
+    const text =
+      'Dear S,\nOn balance I think orders < 50 should be refunded, as Smith\nput it when he wrote:\nRefund them.';
+    expect(stripQuotedReply(text)).toBe(text);
+  });
+  it('cuts French, German, Dutch and Spanish attributions', () => {
+    for (const attr of [
+      'Le lun. 26 oct. 2026 à 10:00, Marie <m@x.fr> a écrit :',
+      'Am Mo., 26. Okt. 2026 um 10:00 Uhr schrieb Max <m@x.de>:',
+      'Op ma 26 okt 2026 om 10:00 schreef Jan <j@x.nl>:',
+      'El lun, 26 oct 2026 a las 10:00, Ana <a@x.es> escribió:',
+    ]) {
+      expect(stripQuotedReply(`Merci.\n\n${attr}\n> ancien`)).toBe('Merci.');
+    }
+  });
   it('drops a trailing quoted block without a marker', () => {
     expect(stripQuotedReply('Sounds good\n\n> earlier\n> lines\n')).toBe('Sounds good');
   });

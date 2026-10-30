@@ -650,6 +650,41 @@ export async function parseMail(source: Uint8Array, timeoutMs = PARSE_TIMEOUT_MS
 }
 
 /**
+ * Reply attributions, in the languages a mail client writes them in: English
+ * `On … wrote:`, French `Le … a écrit :`, German `Am … schrieb …:`, Dutch
+ * `Op … schreef …:`, Spanish `El … escribió:`. Gmail wraps a long one over two
+ * or three lines (`On …, Name <` / `addr> wrote:`).
+ */
+const ATTRIBUTION_START = /^(On|Le|Am|Op|El)\b/;
+const ATTRIBUTION =
+  /^(On\b.*\bwrote|Le\b.*\ba écrit|Am\b.*\bschrieb\b[^:]*|Op\b.*\bschreef\b[^:]*|El\b.*\bescribió)\s*:\s*$/i;
+/** An address in a wrapped attribution: `<a@b>` or a bare a@b, not any stray `<`. */
+const ATTRIBUTION_ADDRESS = /<[^<>\s]+@[^<>\s]+>?|[^\s<>()]+@[^\s<>()]+/;
+/**
+ * Attributions are short. Longer text is never one, and the patterns above are
+ * not linear on long input, so they never see it.
+ */
+const ATTRIBUTION_MAX_CHARS = 500;
+
+/** How many lines (1–3) an attribution starting at `i` takes, or 0 when none does. */
+function attributionAt(lines: string[], i: number): number {
+  const first = lines[i].trim();
+  if (first.length > ATTRIBUTION_MAX_CHARS || !ATTRIBUTION_START.test(first)) return 0;
+  if (ATTRIBUTION.test(first)) return 1;
+  // Wrapped: accepted only with an address in it, so prose that happens to
+  // start "On Monday …" and end a later line with "wrote:" is not cut.
+  for (let k = 2; k <= 3 && i + k <= lines.length; k++) {
+    const joined = lines
+      .slice(i, i + k)
+      .map((l) => l.trim())
+      .join(' ');
+    if (joined.length > 2 * ATTRIBUTION_MAX_CHARS) return 0;
+    if (ATTRIBUTION.test(joined) && ATTRIBUTION_ADDRESS.test(joined)) return k;
+  }
+  return 0;
+}
+
+/**
  * Drop the quoted history a mail client appends to a reply: everything from
  * the "On … wrote:" / "-----Original Message-----" marker on, plus any trailing
  * `>`-quoted lines. Returns the original when stripping would leave nothing —
@@ -668,14 +703,15 @@ export function stripQuotedReply(text: string): string {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     if (
-      /^On\b.*\bwrote:\s*$/.test(line) ||
+      attributionAt(lines, i) > 0 ||
       /^-{2,}\s*Original Message\s*-{2,}$/i.test(line) ||
       /^-{2,}\s*Forwarded message\s*-{2,}$/i.test(line) ||
       /^_{5,}$/.test(line) ||
       // Outlook (web/mobile): a bare rule, then a From:/Sent: header block.
       (/^-{10,}$/.test(line) && /^From:\s/i.test(nextNonEmpty(i + 1))) ||
-      // Outlook without the rule: a From: header followed by Sent:/Date:/To:.
-      (/^From:\s.+/i.test(line) && /^(Sent|Date|To):\s/i.test(nextNonEmpty(i + 1)))
+      // Outlook without the rule: a From: header followed by Sent: or Date:.
+      // Not To: — "From: the committee / To: all staff" is prose.
+      (/^From:\s.+/i.test(line) && /^(Sent|Date):\s/i.test(nextNonEmpty(i + 1)))
     ) {
       cut = i;
       break;
