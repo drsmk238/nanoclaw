@@ -36,6 +36,7 @@ import { ImapFlow } from 'imapflow';
 import { simpleParser, type AddressObject, type Attachment, type ParsedMail } from 'mailparser';
 import nodemailer, { type Transporter } from 'nodemailer';
 
+import { extForMime } from '../attachment-naming.js';
 import { isSafeAttachmentName } from '../attachment-safety.js';
 import { STORE_DIR } from '../config.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../db/messaging-groups.js';
@@ -524,6 +525,30 @@ async function htmlToTextInWorker(html: string, timeoutMs: number, token: string
 }
 
 /**
+ * The text of a mail forwarded as an attachment, headed like an inline
+ * forward. Parsed and converted in the workers, with the same limits; a part
+ * that cannot be read says so instead.
+ */
+export async function forwardedMessageText(source: Uint8Array, token = newMarkToken()): Promise<string> {
+  const head = '---------- Forwarded message (attached) ---------';
+  try {
+    const inner = await parseMail(source);
+    const from = inner.from?.value?.[0];
+    const lines = [
+      head,
+      // The attached mail's own From is its sender's claim, never checked.
+      from?.address && `From (not verified): ${senderLabel(normalizeAddress(from.address), from.name)}`,
+      inner.date && `Date: ${inner.date.toUTCString()}`,
+      inner.subject && `Subject: ${oneLine(inner.subject, SUBJECT_MAX_CHARS)}`,
+    ].filter(Boolean);
+    const text = (await mailText(inner, HTML_TIMEOUT_MS, { token })).slice(0, BODY_MAX_CHARS).trim();
+    return `${lines.join('\n')}\n\n${text}`;
+  } catch {
+    return `${head}\n[The forwarded message attached to this mail could not be read.]`;
+  }
+}
+
+/**
  * A header block larger than this is refused unread. Real headers are a few
  * kilobytes (a long Received chain and References list, 20 KB); mailparser
  * itself gives up at 1 MB.
@@ -880,6 +905,67 @@ export function checkSenderAuth(fromAddress: string, authResults: string[], pmOr
   if (ascii(v.domain) !== ascii(fromDomain)) return `dmarc passed for ${v.domain ?? 'no domain'}, not ${fromDomain}`;
   return null;
 }
+
+/** Extensions for what mail carries beyond the host's own map (attachment-naming.ts). */
+const MAIL_MIME_EXT: Record<string, string> = {
+  'text/calendar': 'ics',
+  'message/rfc822': 'eml',
+  'text/html': 'html',
+  'text/csv': 'csv',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/vnd.ms-powerpoint': 'ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+  'application/rtf': 'rtf',
+};
+
+export function mailExtForMime(contentType: string | undefined): string {
+  const clean = (contentType ?? '').split(';')[0].trim().toLowerCase();
+  return MAIL_MIME_EXT[clean] ?? extForMime(clean);
+}
+
+const RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
+const NAME_MAX_BYTES = 255;
+
+/**
+ * An attachment's name as it is saved, or `fallback` + an extension from its
+ * MIME type when nothing usable is left. The shared guard
+ * (isSafeAttachmentName) keeps a name inside the inbox; this also takes out what makes a name lie or fail: control, text-direction and
+ * zero-width characters (`invoice\u202Efdp.exe` shows as invoiceexe.pdf), leading
+ * dots, dashes and spaces (hidden files, names read as options), trailing dots
+ * and spaces, Windows device names, and anything past 255 bytes (the extension
+ * is kept).
+ */
+export function cleanAttachmentName(
+  raw: string | undefined,
+  contentType: string | undefined,
+  fallback: string,
+): string {
+  const ext = mailExtForMime(contentType);
+  const fallbackName = ext ? `${fallback}.${ext}` : fallback;
+  if (!raw || !isSafeAttachmentName(raw)) return fallbackName;
+  let name = stripInvisible(raw)
+    .replace(/\p{Cc}/gu, '')
+    .replace(/^[.\-\s]+/, '')
+    .replace(/[.\s]+$/, '');
+  if (RESERVED_NAME.test(name)) name = `_${name}`;
+  if (Buffer.byteLength(name, 'utf8') > NAME_MAX_BYTES) {
+    const dot = name.lastIndexOf('.');
+    const tail = dot > 0 && name.length - dot <= 10 ? name.slice(dot) : '';
+    let base = tail ? name.slice(0, dot) : name;
+    while (Buffer.byteLength(base + tail, 'utf8') > NAME_MAX_BYTES) base = base.slice(0, -1);
+    name = base + tail;
+  }
+  if (!name || !isSafeAttachmentName(name)) return fallbackName;
+  return name;
+}
+
+/** Inline images under this size are signature logos and icons, not content. */
+const INLINE_IMAGE_MIN_BYTES = 20_000;
+/** Forwarded messages (message/rfc822) whose text is read into the body. */
+const FORWARDED_READ_MAX = 3;
 
 const ATEXT = "[\\p{L}\\p{N}!#$%&'*+/=?^_`{|}~-]+";
 const LABEL = '[\\p{L}\\p{N}](?:[\\p{L}\\p{N}-]*[\\p{L}\\p{N}])?';
@@ -1567,6 +1653,13 @@ registerChannelAdapter('proton-mail', {
         : undefined;
       const subject = subjectShown?.text || undefined;
       let body = stripQuotedReply(rawText);
+      // A mail forwarded as an attachment ("Forward as Attachment") carries
+      // its whole content in a message/rfc822 part: read its text into the
+      // body, as an inline forward's is. The file is delivered too.
+      const forwarded = parsed.attachments.filter((a) => /^message\/rfc822\b/i.test(a.contentType ?? ''));
+      for (const att of forwarded.slice(0, FORWARDED_READ_MAX)) {
+        body += `\n\n${await forwardedMessageText(att.content, token)}`;
+      }
       if (body.length > BODY_MAX_CHARS) {
         body = body.slice(0, BODY_MAX_CHARS) + `\n\n[… truncated, ${fullText.length} characters in total]`;
       }
@@ -1589,8 +1682,8 @@ registerChannelAdapter('proton-mail', {
         cards: state.cards,
         fromAddress: fromAddr,
         subject,
-        // The reply's own words: `body` also carries the hidden-text note,
-        // which is not the approver's answer.
+        // The reply's own words: `body` also carries any attached forward
+        // and the hidden-text note, which are not the approver's answer.
         body: stripQuotedReply(rawText),
         inReplyTo: parsed.inReplyTo,
       });
@@ -1667,18 +1760,27 @@ registerChannelAdapter('proton-mail', {
       // Attachments only from an address already approved: until then the
       // host stores the whole event with the pending approval, and a stranger
       // should not be able to park 40 MB there per new address.
-      const attachments: Array<{ type: string; name: string; data: string }> = [];
+      const attachments: Array<{ type: string; name: string; data: string; mimeType?: string }> = [];
       const failures: string[] = [];
       const approved = parsed.attachments.length > 0 && (await senderApproved(fromAddr));
       let totalBytes = 0;
       let unlisted = 0;
       // Filenames are the sender's too: each is cut short, and only so many listed.
       const fail = (att: { filename?: string }, type: string, why: string) => {
-        if (failures.length < FAILURES_LISTED_MAX) failures.push(`${oneLine(att.filename ?? type, 100)} (${why})`);
+        if (failures.length < FAILURES_LISTED_MAX)
+          failures.push(`${oneLine(stripInvisible(att.filename ?? type), 100)} (${why})`);
         else unlisted++;
       };
       for (const att of parsed.attachments) {
         const type = classifyAttachment(att.contentType);
+        // Inline images (cid:, in multipart/related) are part of the mail's
+        // look: signature logos are dropped for everyone and never reported as
+        // held back; a larger one, like a photo pasted into the mail, is
+        // delivered as any attachment is.
+        // Outlook puts them in multipart/related; Apple Mail marks them inline
+        // with a Content-ID inside multipart/mixed.
+        const inline = type === 'image' && (att.related === true || (att.contentDisposition === 'inline' && !!att.cid));
+        if (inline && (!approved || att.size < INLINE_IMAGE_MIN_BYTES)) continue;
         if (!approved) {
           fail(att, type, 'sender not yet approved — ask them to send it again');
           continue;
@@ -1694,11 +1796,12 @@ registerChannelAdapter('proton-mail', {
         totalBytes += att.size;
         const fallback = `${type}-${uid}-${attachments.length + 1}`;
         const rawName = att.filename ?? '';
-        const name = isSafeAttachmentName(rawName) ? rawName : fallback;
+        const name = cleanAttachmentName(rawName, att.contentType, fallback);
         if (rawName && name !== rawName) {
-          log.warn('Refused unsafe attachment filename — would escape the inbox', { rawName, replacement: name });
+          log.warn('Attachment filename changed — unsafe or misleading', { rawName, replacement: name });
         }
-        attachments.push({ type, name, data: att.content.toString('base64') });
+        const mimeType = (att.contentType ?? '').split(';')[0].trim().toLowerCase() || undefined;
+        attachments.push({ type, name, data: att.content.toString('base64'), ...(mimeType && { mimeType }) });
       }
 
       if (unlisted > 0) failures.push(`and ${unlisted} more`);

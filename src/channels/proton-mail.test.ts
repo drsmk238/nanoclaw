@@ -35,6 +35,8 @@ import {
   mailingListOf,
   stripQuotedReply,
   mailText,
+  cleanAttachmentName,
+  forwardedMessageText,
   flagInvisibleText,
   parseMail,
   MailRefusedError,
@@ -166,6 +168,58 @@ describe('mailText hidden elements', () => {
     const html = '<span>a</span>'.repeat(30_000);
     await expect(mailText({ text: undefined, html }, 1, { retryable: true })).rejects.toThrow(/HTML conversion/);
     expect(await mailText({ text: undefined, html }, 1)).toMatch(/took too long/);
+  });
+});
+
+describe('cleanAttachmentName', () => {
+  const clean = (raw: string, ct = 'application/pdf') => cleanAttachmentName(raw, ct, 'document-7-1');
+  it('keeps an ordinary name', () => {
+    expect(clean('Minutes 26 Oct.pdf')).toBe('Minutes 26 Oct.pdf');
+  });
+  it('takes out text-direction, zero-width and control characters', () => {
+    expect(clean('invoice\u202Efdp.exe')).toBe('invoicefdp.exe');
+    expect(clean('re\u200Bport.pdf')).toBe('report.pdf');
+    expect(clean('a\nb.pdf')).toBe('ab.pdf');
+  });
+  it('drops leading dots, dashes and spaces, and trailing dots and spaces', () => {
+    expect(clean('.bashrc', 'text/plain')).toBe('bashrc');
+    expect(clean('-rf', 'text/plain')).toBe('rf');
+    expect(clean('report.pdf. ')).toBe('report.pdf');
+  });
+  it('guards Windows device names', () => {
+    expect(clean('CON.txt', 'text/plain')).toBe('_CON.txt');
+    expect(clean('nul', 'text/plain')).toBe('_nul');
+  });
+  it('cuts a long name to 255 bytes, keeping the extension', () => {
+    const name = clean(`${'é'.repeat(300)}.pdf`);
+    expect(Buffer.byteLength(name, 'utf8')).toBeLessThanOrEqual(255);
+    expect(name.endsWith('.pdf')).toBe(true);
+  });
+  it('falls back to a name with an extension from the MIME type', () => {
+    expect(clean('', 'text/calendar')).toBe('document-7-1.ics');
+    expect(clean('../../etc/passwd', 'message/rfc822')).toBe('document-7-1.eml');
+    expect(clean(' ', 'application/pdf')).toBe('document-7-1.pdf');
+    expect(clean('', 'application/x-unknown')).toBe('document-7-1');
+  });
+});
+
+describe('forwardedMessageText', () => {
+  it('reads a mail forwarded as an attachment into a headed block', async () => {
+    const inner = Buffer.from(
+      [
+        'From: Sam Example <sam@example.org>',
+        'Subject: Agenda',
+        'Date: Wed, 28 Oct 2026 15:04:07 +0000',
+        'Content-Type: text/html; charset=utf-8',
+        '',
+        '<p>Item three moves to next week.</p>',
+      ].join('\r\n'),
+    );
+    const text = await forwardedMessageText(inner);
+    expect(text).toContain('---------- Forwarded message (attached) ---------');
+    expect(text).toContain('From (not verified): Sam Example <sam@example.org>');
+    expect(text).toContain('Subject: Agenda');
+    expect(text).toContain('Item three moves to next week.');
   });
 });
 
